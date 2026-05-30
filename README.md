@@ -240,6 +240,8 @@ aws lambda update-function-code \
 | ----- | ---- | -------- | ------- | ----------- |
 | `runtime` | string | No | `bash` | One of: `bash`, `python`, `node` |
 | `code` | string | **Yes** | — | The code to execute |
+| `namespace` | string | No | — | Persistent workspace namespace (see below) |
+| `workspace_root` | string | No | `SANDBOX_WORKSPACE_MOUNT_PATH` env var or `/mnt/workspaces` | Root directory for persistent workspaces |
 | `timeout_ms` | integer | No | `30000` | Max execution time in milliseconds |
 | `args` | string[] | No | `[]` | Command-line arguments passed to the script |
 | `env` | object | No | `{}` | Custom environment variables (key → value) |
@@ -255,13 +257,58 @@ aws lambda update-function-code \
 | `duration_ms` | integer | Wall-clock execution time in milliseconds |
 | `stdout` | string | Captured stdout (truncated to 256 KB) |
 | `stderr` | string | Captured stderr (truncated to 256 KB) |
-| `workspace` | string | Path to the temporary workspace directory |
+| `workspace` | string | Path to the workspace directory used for this run |
+
+---
+
+## Workspace Modes
+
+### Ephemeral (default)
+
+When `namespace` is **not** set, each invocation gets a fresh directory under `/tmp/agent-workspace/<uuid>/`. It is deleted automatically after the call. Good for stateless one-shot scripts.
+
+```json
+{
+  "runtime": "bash",
+  "code": "echo hello"
+}
+```
+
+### Persistent (namespace)
+
+When `namespace` is set, the Lambda uses `{workspace_root}/{namespace}` as the working directory and **never cleans it up**. Files written in one call are still there in the next.
+
+```json
+{
+  "runtime": "bash",
+  "code": "echo hello > greeting.txt",
+  "namespace": "fs-a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+}
+```
+
+Then in the next call:
+
+```json
+{
+  "runtime": "bash",
+  "code": "cat greeting.txt",
+  "namespace": "fs-a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+}
+```
+
+```json
+{ "ok": true, "stdout": "hello\n", ... }
+```
+
+The namespace must match `fs-[a-f0-9]{40}`. When this Lambda is deployed with an S3 Files filesystem mount (e.g. via SST with `fileSystemConfig`), the workspace directory maps directly to that mount, so files persist in S3 across cold starts and Lambda replacements.
+
+`workspace_root` overrides where namespaced workspaces are rooted. The default is the `SANDBOX_WORKSPACE_MOUNT_PATH` environment variable (set by SST to `/mnt/workspaces`) or `/mnt/workspaces` if the variable is absent.
 
 ---
 
 ## Security Notes
 
-- **Workspace isolation:** Each run gets a fresh UUID-named directory under `/tmp/agent-workspace/`. It is deleted after execution.
+- **Workspace isolation:** Ephemeral runs get a fresh UUID-named directory under `/tmp/agent-workspace/`. It is deleted after execution. Persistent runs use a stable namespace path and are never cleaned up by the handler.
 - **Credential isolation:** The child process environment is cleared (`env_clear()`) before setting explicit variables. AWS Lambda credentials are **not** leaked into sandbox code.
 - **Input limits:** Code is capped at 10 MB, environment variables at 256 KB total, and arguments at 64 items / 64 KB total.
 - **Timeout enforcement:** Uses `tokio::time::timeout` with `kill_on_drop` to terminate the child process if it exceeds the limit. Maximum configurable timeout is **300 seconds** (5 minutes).
