@@ -2,6 +2,7 @@ use lambda_agent_sandbox::handler;
 use lambda_runtime::{run, service_fn, Error};
 
 #[tokio::main]
+// Main handler
 async fn main() -> Result<(), Error> {
     run(service_fn(handler)).await
 }
