@@ -91,7 +91,10 @@ jobs:
       - name: Smoke test (amd64 only)
         if: matrix.platform == 'linux/amd64'
         run: |
-          docker run -d --name lambda-smoke -p 9000:8080 lambda-agent-sandbox:local
+          # Override entrypoint with RIE for local testing — production uses bootstrap directly
+          docker run -d --name lambda-smoke -p 9000:8080 \
+            --entrypoint /usr/local/bin/aws-lambda-rie \
+            lambda-agent-sandbox:local /var/runtime/bootstrap
           sleep 6
           curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
             -d '{"runtime":"bash","code":"echo hello; node -v; python3 --version","timeout_ms":30000}' | grep '"ok":true'
