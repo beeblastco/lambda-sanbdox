@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ─── Build stage ───
-FROM rust:1-bookworm AS builder
+FROM rust:1.96.0-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
