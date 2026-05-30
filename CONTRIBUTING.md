@@ -70,7 +70,7 @@ We loosely follow [Conventional Commits](https://www.conventionalcommits.org/):
 | `chore:`   | Maintenance, tooling, dependency bumps   |
 | `docs:`    | Documentation changes                    |
 | `ci:`      | CI/CD pipeline changes                   |
-| `refactor:`| Code restructuring without behaviour change |
+| `refactor:`| Code restructuring without changes       |
 | `test:`    | Adding or updating tests                 |
 
 ---
