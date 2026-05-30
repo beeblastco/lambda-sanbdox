@@ -1,0 +1,33 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2026-05-30
+
+### Added
+
+- Initial release of the Lambda Agent Sandbox
+- AWS Lambda custom runtime that executes arbitrary code in a sandboxed environment
+- Support for `bash`, `python`, and `node` runtimes
+- Isolated per-run workspace under `/tmp/agent-workspace/<uuid>/`
+- Configurable execution timeout (default 30s)
+- stdout/stderr capture with truncation at 256 KB each
+- Custom environment variables and command-line arguments
+- Automatic workspace cleanup after each run
+- `env_clear()` prevents AWS credential leakage into sandbox code
+- Input size limits: 10 MB code, 256 KB env, 64 args / 64 KB total
+- Docker multi-stage build with ARM64/AMD64 support
+- CI/CD pipeline with GitHub Actions (Rust checks, Docker build, smoke tests)
+- Multi-arch Docker image pushed to GitHub Container Registry (GHCR)
+
+### CI/CD
+
+- Initial CI workflow with Rust formatting, linting, and unit tests
+- Docker multi-arch build with layer caching
+- Smoke tests via Lambda Runtime Interface Emulator (RIE)
+- ECR push support with OIDC assume-role for AWS deployment
+- Path filtering to skip Docker builds on unrelated changes
+- Rust toolchain bumped to 1.96.0

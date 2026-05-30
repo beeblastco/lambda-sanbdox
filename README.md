@@ -1,5 +1,9 @@
 # Lambda Agent Sandbox
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.96.0-orange?logo=rust)](https://www.rust-lang.org)
+[![Architecture](https://img.shields.io/badge/architecture-arm64%20%7C%20amd64-blue?logo=docker)](https://www.docker.com)
+
 A Rust-based AWS Lambda custom runtime that executes arbitrary code in a sandboxed environment. Supports `bash`, `python`, and `node` runtimes with timeout enforcement, output capture, and workspace isolation.
 
 ---
@@ -358,6 +362,12 @@ See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full configur
 
 ---
 
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
+
+---
+
 ## License
 
-MIT
+Distributed under the [MIT License](./LICENSE). See [CHANGELOG.md](./CHANGELOG.md) for version history.
