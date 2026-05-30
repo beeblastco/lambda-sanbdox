@@ -12,7 +12,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # ─── Rust checks ───
+  # ─── Rust checks (always runs) ───
   rust-checks:
     runs-on: ubuntu-latest
     steps:
@@ -35,11 +35,31 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  # ─── Docker build & smoke test (PRs only) ───
+  # ─── Detect Docker-relevant changes ───
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docker:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+              - '.dockerignore'
+
+  # ─── Docker build & smoke test (PRs only, image-relevant changes only) ───
   docker-build:
     runs-on: ubuntu-latest
-    needs: rust-checks
-    if: github.event_name == 'pull_request'
+    needs: [rust-checks, changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     permissions:
       contents: read
     steps:
@@ -67,11 +87,11 @@ jobs:
             -d '{"runtime":"bash","code":"echo hello; node -v; python3 --version","timeout_ms":30000}' | grep '"ok":true'
           docker rm -f lambda-smoke
 
-  # ─── Build & push multi-arch image to GHCR (main only) ───
+  # ─── Build & push multi-arch image to GHCR (main only, image-relevant changes only) ───
   push-image:
     runs-on: ubuntu-latest
-    needs: rust-checks
-    if: github.ref == 'refs/heads/main'
+    needs: [rust-checks, changes]
+    if: github.ref == 'refs/heads/main' && needs.changes.outputs.docker == 'true'
     permissions:
       contents: read
       packages: write
