@@ -55,7 +55,16 @@ COPY --from=builder /build/target/release/bootstrap /var/runtime/bootstrap
 RUN chmod +x /var/runtime/bootstrap \
     && mkdir -p /tmp/agent-workspace
 
-# Lambda custom runtime entrypoint.
-# In AWS Lambda, RIE detects the real environment and passes through to bootstrap.
-# In local Docker, RIE emulates the Runtime API on port 8080.
-ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "/var/runtime/bootstrap"]
+# ─── ENTRYPOINT ───
+#
+# Production (AWS Lambda):           ENTRYPOINT ["/var/runtime/bootstrap"]
+# Local testing (with RIE emulator): ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "/var/runtime/bootstrap"]
+#
+# In AWS Lambda, the Runtime API is provided natively — RIE only emulates it
+# for local Docker runs and is not needed in production. When deploying to
+# Lambda, ensure only the production entrypoint is active.
+#
+# ── Production (active) ──
+ENTRYPOINT ["/var/runtime/bootstrap"]
+# ── Testing (comment production above, uncomment below) ──
+# ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "/var/runtime/bootstrap"]
