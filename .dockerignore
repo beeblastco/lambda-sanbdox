@@ -1,0 +1,33 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Git
+.git/
+.gitignore
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation / misc
+README.md
+LICENSE
+*.md
+
+# CI / local test artifacts
+tests/
+.github/
+*.sh
+*.json
+
+# Docker
+Dockerfile*
+.dockerignore

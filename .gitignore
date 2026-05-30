@@ -1,0 +1,22 @@
+# Compiled binaries
+/target/
+
+# Cargo build artifacts
+**/debug/
+**/release/
+
+# Cargo lock file (optional - some prefer to commit this)
+# Cargo.lock
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Rust specific
+*.rs.bk
