@@ -255,27 +255,6 @@ aws lambda update-function-code \
 
 ---
 
-## Project Structure
-
-```sh
-.
-├── .dockerignore           # Docker build context exclusions
-├── .github/
-│   └── workflows/
-│       └── ci.yml          # GitHub Actions CI/CD (Rust checks + Docker build + Trivy + GHCR push)
-├── Cargo.lock              # Locked dependency versions for reproducible builds
-├── Cargo.toml              # Rust dependencies & bootstrap binary config
-├── Dockerfile              # Multi-stage build (Rust → provided:al2023)
-├── README.md               # This file
-├── src/
-│   ├── main.rs             # Thin binary entrypoint
-│   └── lib.rs              # Lambda handler, subprocess spawning, output capture
-└── tests/
-    └── unit_tests.rs       # Rust unit / integration tests
-```
-
----
-
 ## Security Notes
 
 - **Workspace isolation:** Each run gets a fresh UUID-named directory under `/tmp/agent-workspace/`. It is deleted after execution.
