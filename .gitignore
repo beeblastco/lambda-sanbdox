@@ -21,3 +21,4 @@ Thumbs.db
 # Rust specific
 *.rs.bk
 .env
+sandbox_report.md
