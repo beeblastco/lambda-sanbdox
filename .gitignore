@@ -20,3 +20,4 @@ Thumbs.db
 
 # Rust specific
 *.rs.bk
+.env
