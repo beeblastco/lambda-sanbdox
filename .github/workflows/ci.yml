@@ -237,7 +237,10 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPO: ${{ needs.build-platform.outputs.ecr-repo }}
         run: |
-          SHA="${{ github.sha }}"
+          # build-platform tags with docker/metadata-action `type=sha`, which is the
+          # SHORT (7-char) sha — so the per-arch tags are e.g. `<short>-amd64`. Match it
+          # here; using the full github.sha looks up a tag that was never pushed.
+          SHA="${GITHUB_SHA::7}"
 
           # ── GHCR manifests ──
 
