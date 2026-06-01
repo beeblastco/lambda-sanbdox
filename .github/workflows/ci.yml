@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger to force an image rebuild + ECR push. Used to bootstrap a new
+  # region: deploy the filthy-panty SST app first (creates the ECR repo), then run
+  # this to mirror the image in, then re-deploy with SANDBOX_IMAGE_READY=true.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,11 +46,12 @@ jobs:
     permissions:
       contents: read
     outputs:
-      docker: ${{ steps.filter.outputs.docker }}
+      docker: ${{ steps.decide.outputs.docker }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
         id: filter
+        if: github.event_name != 'workflow_dispatch'
         with:
           filters: |
             docker:
@@ -55,6 +60,14 @@ jobs:
               - 'Cargo.lock'
               - 'Dockerfile'
               - '.dockerignore'
+      # A manual run forces docker=true so the build + ECR push always happens.
+      - id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=${{ steps.filter.outputs.docker }}" >> "$GITHUB_OUTPUT"
+          fi
 
   # ─── Parallel Docker build & smoke test (PRs only, image-relevant changes only) ───
   docker-build:
