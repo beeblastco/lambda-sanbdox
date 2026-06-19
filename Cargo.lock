@@ -350,6 +350,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lambda_runtime",
+ "libc",
  "serde",
  "serde_json",
  "shlex",

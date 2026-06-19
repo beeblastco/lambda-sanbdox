@@ -304,6 +304,12 @@ The namespace must match `fs-[a-f0-9]{40}`. When this Lambda is deployed with an
 
 `workspace_root` overrides where namespaced workspaces are rooted. The default is the `SANDBOX_WORKSPACE_MOUNT_PATH` environment variable (set by SST to `/mnt/workspaces`) or `/mnt/workspaces` if the variable is absent.
 
+#### Write durability
+
+After a persistent run finishes, the handler calls `sync(2)` to flush all dirty page-cache writes to the S3 Files mount before the Lambda freezes. This makes files written by the script — including plain shell redirection like `echo data > out.txt` — durable across a later cold container, not just the page cache of the current invocation.
+
+The runtime script itself (`main.sh`/`main.py`/`main.js`) runs from the workspace — so `python`/`node` relative imports resolve against it as before — and is then removed after the run, so persistent workspaces never accumulate it.
+
 ---
 
 ## Security Notes

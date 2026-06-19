@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Flush workspace writes with `sync(2)` after persistent runs so files created by
+  the `bash` tool (e.g. shell redirection) survive a later cold container instead
+  of being lost in the page cache (filthy-panty #46). Stopgap only — the durable
+  fix is a unified shared-data layer (Archil-style) covering durability and
+  multi-agent conflict, tracked in filthy-panty #64.
+- Remove the runtime script after the run so persistent workspaces no longer
+  accumulate a leftover `main.sh`/`main.py`/`main.js` (filthy-panty #66). The
+  script still executes from the workspace, preserving `python`/`node` relative
+  import resolution.
+
 ## [0.1.0] - 2026-05-30
 
 ### Added

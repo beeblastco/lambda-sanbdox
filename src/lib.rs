@@ -226,6 +226,11 @@ async fn execute_request(
         other => return Err(anyhow!("unsupported runtime: {other}")),
     };
 
+    // The script lives in the workspace so it runs with the same cwd and, for
+    // python/node, the same module-resolution root as the workspace (relative
+    // imports / `require('./x')` resolve against the script's own directory). It
+    // is removed after the run so persistent workspaces never accumulate a
+    // leftover main.sh/main.py/main.js for the model to see (issue #66).
     let script_path = workspace.join(script_name);
     fs::write(&script_path, &req.code)
         .await
@@ -283,6 +288,30 @@ async fn execute_request(
     }
 
     let timeout_result = timeout(Duration::from_millis(req.timeout_ms), command.output()).await;
+
+    // Remove the runtime script so it never lingers in a persistent workspace
+    // (issue #66). Best-effort: the sync below flushes the unlink too.
+    let _ = fs::remove_file(&script_path).await;
+
+    // Flush the bash tool's workspace writes (and the script removal above) to the
+    // S3 Files mount before the Lambda freezes. Without this, files written via
+    // shell redirection live only in the page cache and are silently lost on the
+    // next cold container (issue #46). Ephemeral workspaces are deleted right
+    // after the run, so skip them.
+    //
+    // STOPGAP: this is a coarse per-run flush that only prevents silent data loss
+    // on cold containers — it does not address cross-provider durability, hop-2
+    // S3 visibility lag, or multi-agent write conflicts. The intended final fix is
+    // a unified shared-data layer (Archil-style elastic POSIX FS, mountable across
+    // sandboxes) that owns durability + conflict resolution in one place. Tracked
+    // in filthy-panty #64; remove this flush once that layer lands.
+    if req.namespace.is_some() {
+        // SAFETY: sync() takes no arguments and has no failure mode; it flushes
+        // all filesystem buffers (including the NFS-backed workspace mount).
+        unsafe {
+            libc::sync();
+        }
+    }
 
     match timeout_result {
         Ok(output_result) => {
