@@ -42,6 +42,22 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uv /usr/local/bin/uv \
     && mv /root/.local/bin/uvx /usr/local/bin/uvx
 
+# Install ripgrep — the harness `grep` tool shells out to `rg`. AL2023's default
+# dnf repos don't carry ripgrep, so fetch the official static release binary (same
+# pattern as the RIE download below). x86_64 uses the musl build, aarch64 the gnu
+# build, matching ripgrep's published release targets.
+ARG RIPGREP_VERSION=14.1.1
+RUN ARCH=$(uname -m) \
+    && if [ "$ARCH" = "x86_64" ]; then RG_TARGET="x86_64-unknown-linux-musl"; \
+       elif [ "$ARCH" = "aarch64" ]; then RG_TARGET="aarch64-unknown-linux-gnu"; \
+       else echo "unsupported arch for ripgrep: $ARCH" && exit 1; fi \
+    && curl -fsSL -o /tmp/rg.tar.gz \
+       "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}.tar.gz" \
+    && tar -xzf /tmp/rg.tar.gz -C /tmp \
+    && mv "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}/rg" /usr/local/bin/rg \
+    && chmod +x /usr/local/bin/rg \
+    && rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}"
+
 # Install AWS Lambda Runtime Interface Emulator (RIE) for local testing.
 # RIE auto-detects Lambda vs local mode; in local mode it proxies the Runtime API on port 8080.
 RUN ARCH=$(uname -m) \
