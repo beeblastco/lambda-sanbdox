@@ -10,10 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Report `cpu_usec` in the response: CPU time (user + system, including
-  descendants) charged to the sandboxed run, measured via a
-  `getrusage(RUSAGE_CHILDREN)` delta around the child. Lets the harness attribute
-  real sandbox CPU per provider (filthy-panty #8). Omitted on validation errors
-  and timeouts.
+  descendants) charged to the sandboxed run, measured as a delta around the child
+  off the cgroup v2 `cpu.stat` `usage_usec` counter (microsecond resolution, so
+  sub-10ms commands — the common agent case — are counted), falling back to a
+  `getrusage(RUSAGE_CHILDREN)` delta where the cgroup counter is unavailable. Lets
+  the harness attribute real sandbox CPU per provider (filthy-panty #8). Omitted
+  on validation errors and timeouts.
+
+  > Note: an earlier iteration measured only via `getrusage(RUSAGE_CHILDREN)`,
+  > whose child-time accounting is clock-tick granular and rounded short commands
+  > down to zero — the cgroup `usage_usec` read fixes that under-count.
 
 ### Fixed
 

@@ -69,9 +69,10 @@ pub struct ExecResponse {
     pub workspace: String,
 
     /// CPU time (user + system, including descendants) charged to the sandboxed
-    /// process, in microseconds. Measured via a `getrusage(RUSAGE_CHILDREN)`
-    /// delta around the run. Omitted when no child was reaped (validation
-    /// errors, timeouts) so the caller simply skips the CPU sample.
+    /// process, in microseconds. Measured as a delta around the run off the
+    /// cgroup v2 `cpu.stat` `usage_usec` counter (microsecond resolution), with a
+    /// `getrusage(RUSAGE_CHILDREN)` fallback. Omitted when no child was reaped
+    /// (validation errors, timeouts) so the caller simply skips the CPU sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_usec: Option<u64>,
 }
@@ -362,12 +363,44 @@ async fn execute_request(
     }
 }
 
-/// Total CPU (user + system) charged to reaped child processes so far, in
-/// microseconds. Read once before and once after a child runs; the delta is that
-/// child's CPU time. RUSAGE_CHILDREN accumulates process-wide and rolls up the
-/// whole descendant tree (bash waits on its subprocess before exiting), and the
-/// Lambda runs exactly one child per invocation, so the delta is unambiguous.
+/// CPU time charged to this execution environment so far, in microseconds. Read
+/// once before and once after a child runs; the delta is that child's CPU time
+/// (the Lambda runs exactly one child per invocation and blocks on it, so the
+/// runtime's own CPU between the two reads is negligible).
+///
+/// Prefers the cgroup v2 `cpu.stat` `usage_usec` counter, which the kernel tracks
+/// at microsecond resolution from the scheduler's runtime accounting, so even a
+/// sub-10ms command — the common case for an agent's shell calls — is counted.
+/// `getrusage(RUSAGE_CHILDREN)` is the fallback: its child-time accounting is
+/// clock-tick granular and silently rounds short commands down to zero, so it is
+/// used only where the cgroup counter is unavailable.
 fn children_cpu_usec() -> u64 {
+    if let Some(usec) = cgroup_cpu_usec() {
+        return usec;
+    }
+    rusage_children_cpu_usec()
+}
+
+/// cgroup v2 cumulative CPU (`usage_usec`) for this environment, if exposed.
+fn cgroup_cpu_usec() -> Option<u64> {
+    let contents = std::fs::read_to_string("/sys/fs/cgroup/cpu.stat").ok()?;
+    parse_cpu_stat_usage_usec(&contents)
+}
+
+/// Extract the `usage_usec` value (microseconds) from a cgroup v2 `cpu.stat` body.
+fn parse_cpu_stat_usage_usec(contents: &str) -> Option<u64> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("usage_usec ") {
+            return rest.trim().parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// Total CPU (user + system) charged to reaped child processes so far, in
+/// microseconds. RUSAGE_CHILDREN accumulates process-wide and rolls up the whole
+/// descendant tree (bash waits on its subprocess before exiting).
+fn rusage_children_cpu_usec() -> u64 {
     // SAFETY: getrusage only writes into the provided rusage; reading a zeroed
     // struct back is sound and RUSAGE_CHILDREN has no failure mode for a valid
     // pointer. On the unexpected error path we report 0 rather than panic.
@@ -397,10 +430,10 @@ pub fn truncate_string(s: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod cpu_tests {
-    use super::children_cpu_usec;
+    use super::{children_cpu_usec, parse_cpu_stat_usage_usec};
 
-    /// A reaped CPU-burning child must register a non-trivial RUSAGE_CHILDREN
-    /// delta — this is the measurement that backs ExecResponse.cpu_usec.
+    /// A reaped CPU-burning child must register a non-trivial delta — this is the
+    /// measurement that backs ExecResponse.cpu_usec.
     #[test]
     fn children_cpu_usec_counts_a_busy_child() {
         let before = children_cpu_usec();
@@ -413,5 +446,23 @@ mod cpu_tests {
         assert!(result.status.success());
         let delta = children_cpu_usec() - before;
         assert!(delta > 0, "expected child CPU to be counted, got {delta}us");
+    }
+
+    /// The microsecond `usage_usec` line is what we read for accurate sub-tick CPU.
+    #[test]
+    fn parses_usage_usec_from_cpu_stat() {
+        let sample = "usage_usec 1234567\nuser_usec 1000000\nsystem_usec 234567\n";
+        assert_eq!(parse_cpu_stat_usage_usec(sample), Some(1_234_567));
+    }
+
+    /// A body without the counter (e.g. a non-cgroup-v2 host) yields None so the
+    /// caller falls back to getrusage instead of reporting a bogus zero.
+    #[test]
+    fn returns_none_when_usage_usec_absent() {
+        assert_eq!(
+            parse_cpu_stat_usage_usec("nr_periods 0\nnr_throttled 0\n"),
+            None
+        );
+        assert_eq!(parse_cpu_stat_usage_usec(""), None);
     }
 }
