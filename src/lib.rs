@@ -67,6 +67,13 @@ pub struct ExecResponse {
     pub stdout: String,
     pub stderr: String,
     pub workspace: String,
+
+    /// CPU time (user + system, including descendants) charged to the sandboxed
+    /// process, in microseconds. Measured via a `getrusage(RUSAGE_CHILDREN)`
+    /// delta around the run. Omitted when no child was reaped (validation
+    /// errors, timeouts) so the caller simply skips the CPU sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
 }
 
 fn default_runtime() -> String {
@@ -120,6 +127,7 @@ pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
                 stdout: "".to_string(),
                 stderr: format!("invalid request json: {e}"),
                 workspace: "".to_string(),
+                cpu_usec: None,
             }));
         }
     };
@@ -136,6 +144,7 @@ pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
                 stdout: "".to_string(),
                 stderr: e.to_string(),
                 workspace: "".to_string(),
+                cpu_usec: None,
             }));
         }
     };
@@ -150,6 +159,7 @@ pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             stdout: "".to_string(),
             stderr: format!("failed to create workspace: {e}"),
             workspace: "".to_string(),
+            cpu_usec: None,
         }));
     }
 
@@ -164,6 +174,7 @@ pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
             stdout: "".to_string(),
             stderr: e.to_string(),
             workspace: workspace.display().to_string(),
+            cpu_usec: None,
         }),
     };
 
@@ -287,7 +298,11 @@ async fn execute_request(
         command.env(key, value);
     }
 
+    let cpu_before = children_cpu_usec();
     let timeout_result = timeout(Duration::from_millis(req.timeout_ms), command.output()).await;
+    // Read immediately after the child is reaped (output() awaits the wait), before
+    // the parent-side script removal / sync below touch anything.
+    let cpu_usec = children_cpu_usec().saturating_sub(cpu_before);
 
     // Remove the runtime script so it never lingers in a persistent workspace
     // (issue #66). Best-effort: the sync below flushes the unlink too.
@@ -327,8 +342,12 @@ async fn execute_request(
                 stdout,
                 stderr,
                 workspace: workspace.display().to_string(),
+                cpu_usec: Some(cpu_usec),
             })
         }
+        // On timeout the child is SIGKILLed via kill_on_drop and reaped
+        // asynchronously, so RUSAGE_CHILDREN may not yet reflect it — omit the
+        // sample rather than report a misleading partial number.
         Err(_) => Ok(ExecResponse {
             ok: false,
             runtime: req.runtime.clone(),
@@ -338,8 +357,29 @@ async fn execute_request(
             stdout: "".to_string(),
             stderr: format!("execution timed out after {} ms", req.timeout_ms),
             workspace: workspace.display().to_string(),
+            cpu_usec: None,
         }),
     }
+}
+
+/// Total CPU (user + system) charged to reaped child processes so far, in
+/// microseconds. Read once before and once after a child runs; the delta is that
+/// child's CPU time. RUSAGE_CHILDREN accumulates process-wide and rolls up the
+/// whole descendant tree (bash waits on its subprocess before exiting), and the
+/// Lambda runs exactly one child per invocation, so the delta is unambiguous.
+fn children_cpu_usec() -> u64 {
+    // SAFETY: getrusage only writes into the provided rusage; reading a zeroed
+    // struct back is sound and RUSAGE_CHILDREN has no failure mode for a valid
+    // pointer. On the unexpected error path we report 0 rather than panic.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) } != 0 {
+        return 0;
+    }
+    timeval_usec(usage.ru_utime) + timeval_usec(usage.ru_stime)
+}
+
+fn timeval_usec(tv: libc::timeval) -> u64 {
+    (tv.tv_sec.max(0) as u64) * 1_000_000 + (tv.tv_usec.max(0) as u64)
 }
 
 pub fn truncate_string(s: &str, max_bytes: usize) -> String {
@@ -353,4 +393,25 @@ pub fn truncate_string(s: &str, max_bytes: usize) -> String {
     let mut truncated = s[..boundary].to_string();
     truncated.push_str("\n...[truncated]");
     truncated
+}
+
+#[cfg(test)]
+mod cpu_tests {
+    use super::children_cpu_usec;
+
+    /// A reaped CPU-burning child must register a non-trivial RUSAGE_CHILDREN
+    /// delta — this is the measurement that backs ExecResponse.cpu_usec.
+    #[test]
+    fn children_cpu_usec_counts_a_busy_child() {
+        let before = children_cpu_usec();
+        // A burst of pure CPU; output() waits (and thus reaps) the child.
+        let result = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("n=0; while [ $n -lt 5000000 ]; do n=$((n+1)); done")
+            .output()
+            .expect("spawn busy child");
+        assert!(result.status.success());
+        let delta = children_cpu_usec() - before;
+        assert!(delta > 0, "expected child CPU to be counted, got {delta}us");
+    }
 }

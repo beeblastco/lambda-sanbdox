@@ -116,7 +116,8 @@ curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations
   "duration_ms": 1234,
   "stdout": "hello from bash\nv22.x.x\nPython 3.x.x\nHTTP/2 200",
   "stderr": "",
-  "workspace": "/tmp/agent-workspace/<uuid>"
+  "workspace": "/tmp/agent-workspace/<uuid>",
+  "cpu_usec": 84210
 }
 ```
 
@@ -258,6 +259,7 @@ aws lambda update-function-code \
 | `stdout` | string | Captured stdout (truncated to 256 KB) |
 | `stderr` | string | Captured stderr (truncated to 256 KB) |
 | `workspace` | string | Path to the workspace directory used for this run |
+| `cpu_usec` | integer | CPU time (user + system, incl. descendants) charged to the run, in microseconds. Omitted on validation errors and timeouts. |
 
 ---
 

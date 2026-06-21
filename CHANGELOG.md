@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Report `cpu_usec` in the response: CPU time (user + system, including
+  descendants) charged to the sandboxed run, measured via a
+  `getrusage(RUSAGE_CHILDREN)` delta around the child. Lets the harness attribute
+  real sandbox CPU per provider (filthy-panty #8). Omitted on validation errors
+  and timeouts.
+
 ### Fixed
 
 - Flush workspace writes with `sync(2)` after persistent runs so files created by
