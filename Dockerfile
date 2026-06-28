@@ -20,7 +20,8 @@ FROM public.ecr.aws/lambda/microvms:al2023-minimal
 # Toolchain the agent's bash/python/node code expects, plus fuse + util-linux so the
 # /run hook can mount the workspace with mountpoint-s3.
 # Packages: git, jq, tar, gzip, unzip, which, findutils, procps-ng, util-linux,
-#           python3, python3-pip, shadow-utils, ca-certificates, fuse, fuse-libs, nodejs.
+#           python3, python3-pip, shadow-utils, ca-certificates, fuse, fuse-libs,
+#           mount-s3, nodejs.
 RUN dnf install -y \
     git \
     jq \
@@ -37,6 +38,7 @@ RUN dnf install -y \
     ca-certificates \
     fuse \
     fuse-libs \
+    mount-s3 \
     && curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - \
     && dnf install -y nodejs \
     && dnf clean all \
@@ -59,17 +61,6 @@ RUN ARCH=$(uname -m) \
     && mv "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}/rg" /usr/local/bin/rg \
     && chmod +x /usr/local/bin/rg \
     && rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}"
-
-# Install mountpoint-s3 (`mount-s3`). The /run lifecycle hook uses it to mount the
-# namespace-scoped workspace S3 prefix at /mnt/workspaces/<namespace>.
-RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "aarch64" ]; then MS3_ARCH="arm64"; \
-       else echo "unsupported arch for mountpoint-s3: $ARCH" && exit 1; fi \
-    && curl -fsSL -o /tmp/mount-s3.rpm \
-       "https://s3.amazonaws.com/mountpoint-s3-release/latest/${MS3_ARCH}/mount-s3.rpm" \
-    && rpm -Uvh /tmp/mount-s3.rpm \
-    && dnf clean all \
-    && rm -f /tmp/mount-s3.rpm
 
 # Copy the compiled server binary.
 COPY --from=builder /build/target/release/sandbox-server /usr/local/bin/sandbox-server
