@@ -68,7 +68,7 @@ RUN ARCH=$(uname -m) \
     && curl -fsSL -o /tmp/mount-s3.rpm \
        "https://s3.amazonaws.com/mountpoint-s3-release/latest/${MS3_ARCH}/mount-s3.rpm" \
     && cd /tmp \
-    && dnf install -y --nogpgcheck ./mount-s3.rpm \
+    && dnf install -y ./mount-s3.rpm \
     && dnf clean all \
     && rm -f /tmp/mount-s3.rpm
 
