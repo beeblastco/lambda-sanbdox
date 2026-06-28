@@ -1,17 +1,20 @@
-//! Lambda Agent Sandbox — core library for the AWS Lambda custom runtime handler.
+//! Agent sandbox — core exec engine for the AWS Lambda MicroVM sandbox image.
 //!
 //! Spawns bash/python/node subprocesses in isolated workspaces, captures output,
-//! enforces timeouts, and returns structured JSON responses.
+//! enforces timeouts, and returns structured JSON responses. Transport-agnostic:
+//! `run_exec` is driven by the long-lived HTTP server in `main.rs` (`POST /exec`),
+//! which replaced the old Lambda Invoke entrypoint. The persistent-workspace S3
+//! mount is set up by the `/run` lifecycle hook via the [`mount`] module.
 //!
 //! Workspace modes:
 //!   - Persistent: `namespace` provided → uses `{workspace_root}/{namespace}`, never cleaned up.
-//!     Files persist across calls via the S3 Files mount.
+//!     Files persist across calls via the S3 mount the `/run` hook established.
 //!   - Ephemeral: no `namespace` → fresh /tmp/agent-workspace/<uuid>, cleaned up after.
 
+pub mod mount;
+
 use anyhow::{anyhow, Context};
-use lambda_runtime::{Error, LambdaEvent};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -113,70 +116,57 @@ fn resolve_workspace(req: &ExecRequest) -> Result<(PathBuf, bool), anyhow::Error
     }
 }
 
-pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
-    let started = Instant::now();
+/// Build an `ok: false` response for a failure that aborted before (or instead of)
+/// running a child. `workspace` is the resolved path when known, else empty.
+fn error_response(
+    runtime: &str,
+    started: Instant,
+    stderr: String,
+    workspace: String,
+) -> ExecResponse {
+    ExecResponse {
+        ok: false,
+        runtime: runtime.to_string(),
+        exit_code: None,
+        timed_out: false,
+        duration_ms: started.elapsed().as_millis(),
+        stdout: String::new(),
+        stderr,
+        workspace,
+        cpu_usec: None,
+    }
+}
 
-    let req: ExecRequest = match serde_json::from_value(event.payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return Ok(json!(ExecResponse {
-                ok: false,
-                runtime: "unknown".to_string(),
-                exit_code: None,
-                timed_out: false,
-                duration_ms: started.elapsed().as_millis(),
-                stdout: "".to_string(),
-                stderr: format!("invalid request json: {e}"),
-                workspace: "".to_string(),
-                cpu_usec: None,
-            }));
-        }
-    };
+/// Run one exec request end to end: resolve the workspace, create it, execute the
+/// code, and clean up an ephemeral workspace afterwards. Internal failures are
+/// mapped into an `ok: false` ExecResponse (this never returns an Err) so the HTTP
+/// layer always has a structured body to send back — identical semantics to the
+/// old Lambda Invoke handler, just without the Lambda envelope.
+pub async fn run_exec(req: ExecRequest) -> ExecResponse {
+    let started = Instant::now();
 
     let (workspace, ephemeral) = match resolve_workspace(&req) {
         Ok(w) => w,
-        Err(e) => {
-            return Ok(json!(ExecResponse {
-                ok: false,
-                runtime: req.runtime,
-                exit_code: None,
-                timed_out: false,
-                duration_ms: started.elapsed().as_millis(),
-                stdout: "".to_string(),
-                stderr: e.to_string(),
-                workspace: "".to_string(),
-                cpu_usec: None,
-            }));
-        }
+        Err(e) => return error_response(&req.runtime, started, e.to_string(), String::new()),
     };
 
     if let Err(e) = fs::create_dir_all(&workspace).await {
-        return Ok(json!(ExecResponse {
-            ok: false,
-            runtime: req.runtime,
-            exit_code: None,
-            timed_out: false,
-            duration_ms: started.elapsed().as_millis(),
-            stdout: "".to_string(),
-            stderr: format!("failed to create workspace: {e}"),
-            workspace: "".to_string(),
-            cpu_usec: None,
-        }));
+        return error_response(
+            &req.runtime,
+            started,
+            format!("failed to create workspace: {e}"),
+            String::new(),
+        );
     }
 
     let result = match execute_request(&req, &workspace, started).await {
-        Ok(resp) => json!(resp),
-        Err(e) => json!(ExecResponse {
-            ok: false,
-            runtime: req.runtime.clone(),
-            exit_code: None,
-            timed_out: false,
-            duration_ms: started.elapsed().as_millis(),
-            stdout: "".to_string(),
-            stderr: e.to_string(),
-            workspace: workspace.display().to_string(),
-            cpu_usec: None,
-        }),
+        Ok(resp) => resp,
+        Err(e) => error_response(
+            &req.runtime,
+            started,
+            e.to_string(),
+            workspace.display().to_string(),
+        ),
     };
 
     if ephemeral {
@@ -188,7 +178,7 @@ pub async fn handler(event: LambdaEvent<Value>) -> Result<Value, Error> {
         }
     }
 
-    Ok(result)
+    result
 }
 
 async fn execute_request(

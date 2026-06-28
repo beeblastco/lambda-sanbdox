@@ -1,27 +1,33 @@
-# Lambda Agent Sandbox
+# Lambda MicroVM Agent Sandbox
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.96.0-orange?logo=rust)](https://www.rust-lang.org)
 [![Architecture](https://img.shields.io/badge/architecture-arm64%20%7C%20amd64-blue?logo=docker)](https://www.docker.com)
 
-A Rust-based AWS Lambda custom runtime that executes arbitrary code in a sandboxed environment. Supports `bash`, `python`, and `node` runtimes with timeout enforcement, output capture, and workspace isolation.
+A Rust **HTTP server**, packaged as an [AWS Lambda MicroVM](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html) image, that executes arbitrary code in a Firecracker-isolated environment. Supports `bash`, `python`, and `node` with timeout enforcement, output capture, and an S3-backed persistent workspace.
+
+> **Migration note (v0.2):** this used to be a Lambda *custom runtime* invoked per request (`bootstrap` + the Runtime API / RIE). A MicroVM instead runs the container as a **long-lived server**, so the binary is now `sandbox-server` and the wire protocol is HTTP. The exec request/response JSON is unchanged — only the transport moved from Invoke to `POST /exec`.
 
 ---
 
 ## What It Does
 
-This project provides an AWS Lambda function that accepts JSON events describing code to run, spawns the code in an isolated temporary workspace, captures stdout/stderr/exit code, and returns a structured JSON response.
+A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which listens on two ports:
+
+- **`:8080` — exec API.** `POST /exec` takes a JSON request describing code to run, spawns it in an isolated workspace, captures stdout/stderr/exit code, and returns a structured JSON response. The MicroVM proxy routes external `443` here.
+- **`:9000` — lifecycle hooks.** The endpoints AWS Lambda calls at MicroVM transitions (`/ready`, `/run`, `/resume`, `/suspend`, `/terminate`). `/run` mounts the workspace S3 prefix with [mountpoint-s3](https://github.com/awslabs/mountpoint-s3).
 
 **Supported runtimes:** `bash`, `python` (python3), `node` (Node.js)
 
 **Key features:**
 
-- Isolated per-run workspace under `/tmp/agent-workspace/<uuid>/`
-- Configurable execution timeout (default 30s)
+- Isolated per-run workspace under `/tmp/agent-workspace/<uuid>/` (ephemeral) or `/mnt/workspaces/<namespace>/` (persistent, S3-backed)
+- Configurable execution timeout (default 30s, 300s cap)
 - stdout/stderr capture with truncation at 256 KB each
 - Custom environment variables and command-line arguments
-- Automatic workspace cleanup after each run
+- Automatic ephemeral-workspace cleanup after each run
 - `env_clear()` prevents AWS credential leakage into sandbox code
+- Execs are serialized so the per-run `cpu_usec` accounting stays exact
 - Input size limits: 10 MB code, 256 KB env, 64 args / 64 KB total
 
 ---
@@ -30,7 +36,7 @@ This project provides an AWS Lambda function that accepts JSON events describing
 
 | Tool | Version | Purpose |
 | ---- | ------- | ------- |
-| [Rust](https://rustup.rs/) | 1.80+ | Build the bootstrap binary |
+| [Rust](https://rustup.rs/) | 1.80+ | Build the `sandbox-server` binary |
 | [Docker](https://docs.docker.com/get-docker/) | 24+ | Build and run the container locally |
 | [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | 2.x | Deploy to Lambda (optional) |
 
@@ -50,7 +56,7 @@ cd lambda-agent-sandbox
 ### 2. Build the Rust binary
 
 ```bash
-cargo build --release --bin bootstrap
+cargo build --release --bin sandbox-server
 ```
 
 ### 3. Run Rust quality checks
@@ -76,28 +82,28 @@ docker build -t lambda-agent-sandbox .
 
 The Dockerfile is a multi-stage build:
 
-- **Builder stage:** `rust:1-bookworm` compiles the `bootstrap` binary
-- **Runtime stage:** `public.ecr.aws/lambda/provided:al2023` with bash, git, jq, curl, python3, Node.js 22, and `uv`
+- **Builder stage:** `rust:1.96.0-bookworm` compiles the `sandbox-server` binary
+- **Runtime stage:** `public.ecr.aws/lambda/microvms:al2023-minimal` (the MicroVM managed base) with bash, git, jq, python3, Node.js 22, `uv`, ripgrep, and `mount-s3`
 
 ---
 
-## Run Locally (Lambda Runtime Interface Emulator)
+## Run Locally (HTTP server)
 
-The image includes the AWS Lambda Runtime Interface Emulator (RIE) so you can test locally without deploying to AWS.
+The image runs the same `sandbox-server` locally as it does inside a MicroVM, so a plain `docker run` reproduces the runtime. A stateless exec needs no fuse/privileges; the S3 workspace mount (`/run` hook) does, so test that against a real MicroVM.
 
 ### Start the container
 
 ```bash
-docker run -d --name lambda-test -p 9000:8080 lambda-agent-sandbox
-sleep 5
+docker build -t lambda-agent-sandbox .
+docker run -d --name sandbox -p 8080:8080 -p 9000:9000 lambda-agent-sandbox
+sleep 3
 ```
-
-> **Important:** The RIE does not support concurrent requests. Send requests **one at a time** or the emulator will panic.
 
 ### Send a test request
 
 ```bash
-curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+curl -s -X POST "http://localhost:8080/exec" \
+  -H 'content-type: application/json' \
   -d '{
     "runtime": "bash",
     "code": "echo hello from bash; node -v; python3 --version; curl -sI https://example.com | head -n 1",
@@ -121,115 +127,61 @@ curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations
 }
 ```
 
-### Python example
+### Lifecycle hooks
 
 ```bash
-cat > /tmp/py.json << 'EOF'
-{
-  "runtime": "python",
-  "code": "import sys, os, subprocess\nprint(sys.version)\nprint(os.getcwd())\nprint(subprocess.check_output(['bash', '-lc', 'echo nested bash works']).decode())",
-  "timeout_ms": 30000
-}
-EOF
-curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
-  -d @/tmp/py.json
-```
-
-### Node.js example
-
-```bash
-cat > /tmp/node.json << 'EOF'
-{
-  "runtime": "node",
-  "code": "const { execSync } = require('child_process'); console.log(process.version); console.log(execSync('python3 --version').toString());",
-  "timeout_ms": 30000
-}
-EOF
-curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
-  -d @/tmp/node.json
+# /ready returns 200 once the server is up
+curl -i -X POST "http://localhost:9000/aws/lambda-microvms/runtime/v1/ready"
 ```
 
 ### Timeout test
 
 ```bash
-curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+curl -s -X POST "http://localhost:8080/exec" \
   -d '{"runtime": "bash", "code": "sleep 5", "timeout_ms": 1000}'
-```
-
-**Expected response:**
-
-```json
-{
-  "ok": false,
-  "timed_out": true,
-  "stderr": "execution timed out after 1000 ms",
-  ...
-}
+# => {"ok":false,"timed_out":true,"stderr":"execution timed out after 1000 ms", ...}
 ```
 
 ### Stop the container
 
 ```bash
-docker rm -f lambda-test
+docker rm -f sandbox
 ```
 
 ---
 
-## Deploy to AWS Lambda
+## Publish as a MicroVM image
 
-### 1. Push the image to Amazon ECR
-
-```bash
-# Create the ECR repository (once)
-aws ecr create-repository --repository-name lambda-agent-sandbox --region us-east-1
-
-# Get the login token
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
-
-# Tag and push
-docker tag lambda-agent-sandbox:latest \
-  <account-id>.dkr.ecr.us-east-1.amazonaws.com/lambda-agent-sandbox:latest
-
-docker push \
-  <account-id>.dkr.ecr.us-east-1.amazonaws.com/lambda-agent-sandbox:latest
-```
-
-### 2. Create the Lambda function
+A MicroVM image is **not** an ECR-image Lambda. AWS builds the image itself from a
+zip containing the `Dockerfile` + sources, snapshots it, and versions it. CI does
+this in [`.github/workflows/microvm-image.yml`](.github/workflows/microvm-image.yml);
+the manual equivalent:
 
 ```bash
-aws lambda create-function \
-  --function-name agent-sandbox \
-  --package-type Image \
-  --code ImageUri=<account-id>.dkr.ecr.us-east-1.amazonaws.com/lambda-agent-sandbox:latest \
-  --role arn:aws:iam::<account-id>:role/lambda-agent-sandbox-role \
-  --timeout 30 \
-  --memory-size 512 \
-  --architectures arm64
+# 1. Package the code artifact (Dockerfile at the zip root + everything it COPYs)
+zip -r artifact.zip Dockerfile Cargo.toml Cargo.lock src
+aws s3 cp artifact.zip "s3://${ARTIFACT_BUCKET}/microvm-images/broods-sandbox/$(git rev-parse --short HEAD).zip"
+
+# 2. Create (first time) the image, declaring the lifecycle hooks on port 9000
+aws lambda-microvms create-microvm-image \
+  --name broods-sandbox \
+  --base-image-arn "$(aws lambda-microvms list-managed-microvm-images \
+      --query 'reverse(sort_by(managedMicrovmImages,&imageArn))[0].imageArn' --output text)" \
+  --build-role-arn "$MICROVM_BUILD_ROLE_ARN" \
+  --code-artifact '{"uri":"s3://.../broods-sandbox/<sha>.zip"}' \
+  --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
+
+# 3. Ship new code as a new version
+aws lambda-microvms update-microvm-image \
+  --image-identifier "arn:aws:lambda:<region>:<account>:microvm-image:broods-sandbox" \
+  --base-image-arn "<base>" --build-role-arn "$MICROVM_BUILD_ROLE_ARN" \
+  --code-artifact '{"uri":"s3://.../broods-sandbox/<sha>.zip"}' --hooks '<same as above>'
 ```
 
-> **Note:** The Lambda execution role needs the basic Lambda execution policy. Create it in IAM if it doesn't exist.
-
-### 3. Invoke the function
-
-```bash
-aws lambda invoke \
-  --function-name agent-sandbox \
-  --payload '{"runtime":"bash","code":"echo hello from lambda","timeout_ms":10000}' \
-  response.json
-
-cat response.json
-```
-
-### 4. Update an existing function
-
-After rebuilding and pushing a new image:
-
-```bash
-aws lambda update-function-code \
-  --function-name agent-sandbox \
-  --image-uri <account-id>.dkr.ecr.us-east-1.amazonaws.com/lambda-agent-sandbox:latest
-```
+The build role, artifact bucket, and execution role are provisioned by the broods
+SST app (`apps/core/sst.config.ts`, gated behind `microvmPrereqsEnabled`). The
+harness then runs MicroVMs from this image via `MICROVM_IMAGE_IDENTIFIER`. See the
+broods `docs/workspace/sandbox/microvm.md` for the full operator flow.
 
 ---
 
@@ -348,14 +300,14 @@ curl -d '{
       "timeout_ms": 30000
     }
     EOF
-    curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+    curl -s -X POST "http://localhost:8080/exec" \
       -d @/tmp/payload.json
     ```
 
 2. Use a heredoc with `curl -d @-`
 
     ```bash
-    curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+    curl -s -X POST "http://localhost:8080/exec" \
       -d @- << 'EOF'
     {"runtime":"bash","code":"echo 'hello from bash'","timeout_ms":30000}
     EOF
@@ -365,14 +317,14 @@ curl -d '{
 
     ```bash
     jq -n '{runtime: "bash", code: "echo \'hello from bash\'", timeout_ms: 30000}' | \
-      curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" -d @-
+      curl -s -X POST "http://localhost:8080/exec" -d @-
     ```
 
 4. Escape single quotes inside double-quoted shell strings
     In bash, `'` inside `"..."` is literal, but `"` must be escaped with `\`:
 
     ```bash
-    curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+    curl -s -X POST "http://localhost:8080/exec" \
       -d "{\"runtime\":\"bash\",\"code\":\"echo 'hello from bash'\",\"timeout_ms\":30000}"
     ```
 
@@ -384,12 +336,12 @@ curl -d '{
 
 | Issue | Cause | Fix |
 | ----- | ----- | --- |
-| `curl: (7) Failed to connect` | Container not running or RIE not ready | Wait 5 seconds after `docker run`; check `docker logs lambda-test` |
-| RIE panic / crash | Concurrent requests sent to local emulator | Send requests **sequentially**, one at a time |
-| `exec format error` | Wrong architecture RIE binary | The Dockerfile maps `aarch64` → `arm64`; should work on ARM64 |
+| `curl: (7) Failed to connect` | Server not up yet | Wait a few seconds after `docker run`; check `docker logs sandbox` |
 | Code returns `ok: false` with no output | Script error or non-zero exit | Check `stderr` and `exit_code` in the response |
-| `uv` not found | `~/.local/bin` not on PATH | The Dockerfile symlinks `uv` to `/usr/local/bin/uv`; rebuild if missing |
-| `EOF while parsing a string` | Invalid JSON sent to RIE (usually bad shell quoting) | See **Shell Quoting with curl** above |
+| `uv` not found | `~/.local/bin` not on PATH | The Dockerfile moves `uv` to `/usr/local/bin/uv`; rebuild if missing |
+| `502` from the MicroVM proxy | App not listening on 8080 yet (snapshot still warming) | The harness retries within its warm-up budget; if it persists, check `/ready` + that the server binds `0.0.0.0:8080` |
+| `/run` returns 500 | `mount-s3` failed (bad creds, region, or bucket) | Check the MicroVM logs for the `mount-s3 failed` line; verify the scoped credentials and prefix in `runHookPayload` |
+| MicroVM build `FAILED` | Dockerfile build or `/ready` hook failed | See the [troubleshooting page](https://docs.aws.amazon.com/lambda/latest/dg/microvms-troubleshooting.html); inspect `stateReason` via `get-microvm-image` |
 
 ---
 
@@ -401,19 +353,17 @@ This repository uses **GitHub Actions** for continuous integration and delivery.
 
 - **Rust checks:** `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`
 - **Docker build:** Multi-arch image (`linux/amd64`, `linux/arm64`) with layer caching
-- **Security scan:** Trivy vulnerability scanner uploads SARIF results to the GitHub Security tab
-- **Smoke test:** Spins up the container locally and verifies bash + node + python execution via RIE
+- **Smoke test:** Starts the container and verifies `/ready` (200) + a stateless `POST /exec` returns `ok:true`
 
 ### On push to `main`
 
 - All PR checks run first
-- The multi-arch image is pushed to **GitHub Container Registry (GHCR)**:
-  - `ghcr.io/<owner>/lambda-agent-sandbox:latest`
-  - `ghcr.io/<owner>/lambda-agent-sandbox:<sha>`
+- **MicroVM image publish** ([`microvm-image.yml`](.github/workflows/microvm-image.yml)): zips the Dockerfile + sources, uploads to the SST-provisioned artifact bucket, and creates/versions the MicroVM image (skipped until the required repo vars/secrets are set)
+- The multi-arch container image is also pushed to GHCR/ECR for local reproducibility
 
-### Workflow file
+### Workflow files
 
-See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) for the full configuration.
+See [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/microvm-image.yml`](.github/workflows/microvm-image.yml).
 
 ---
 

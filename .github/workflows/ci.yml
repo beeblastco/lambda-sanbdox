@@ -114,14 +114,18 @@ jobs:
       - name: Smoke test (amd64 only)
         if: matrix.platform == 'linux/amd64'
         run: |
-          # Override entrypoint with RIE for local testing — production uses bootstrap directly
-          docker run -d --name lambda-smoke -p 9000:8080 \
-            --entrypoint /usr/local/bin/aws-lambda-rie \
-            lambda-agent-sandbox:local /var/runtime/bootstrap
-          sleep 6
-          curl -s -X POST "http://localhost:9000/2015-03-31/functions/function/invocations" \
+          # The image now runs the long-lived HTTP server (sandbox-server) directly:
+          # exec API on 8080, lifecycle hooks on 9000. A stateless bash/node/python
+          # exec needs no fuse/privileges, so a plain docker run exercises it.
+          docker run -d --name sandbox-smoke -p 8080:8080 -p 9000:9000 lambda-agent-sandbox:local
+          sleep 4
+          # Lifecycle /ready hook is up (200).
+          curl -fsS -X POST "http://localhost:9000/aws/lambda-microvms/runtime/v1/ready" -o /dev/null
+          # Exec API returns ok:true for a stateless run.
+          curl -fsS -X POST "http://localhost:8080/exec" \
+            -H 'content-type: application/json' \
             -d '{"runtime":"bash","code":"echo hello; node -v; python3 --version","timeout_ms":30000}' | grep '"ok":true'
-          docker rm -f lambda-smoke
+          docker rm -f sandbox-smoke
 
   # ─── Parallel per-platform build & push to every ECR_REGIONS region + GHCR (main only) ───
   build-platform:

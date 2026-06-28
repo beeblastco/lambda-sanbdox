@@ -1,0 +1,114 @@
+name: MicroVM image
+
+# Publishes this repo as an AWS Lambda MicroVM image. The MicroVM build model is
+# NOT the old ECR-image-Lambda model: AWS builds the image itself from a zip
+# containing the Dockerfile + sources, then snapshots it. This workflow zips the
+# artifact, uploads it to the SST-provisioned artifact bucket, and creates (first
+# run) or versions (subsequent runs) the MicroVM image.
+#
+# Required (set per deploy region as repo variables/secrets — they come from the
+# broods SST app, gated behind microvmPrereqsEnabled):
+#   secrets.AWS_ROLE_ARN              OIDC role this workflow assumes
+#   vars.MICROVM_REGION               e.g. us-east-1 (must match the artifact bucket region)
+#   vars.MICROVM_ARTIFACT_BUCKET      SST: MICROVM_ARTIFACTS_BUCKET_NAME
+#   vars.MICROVM_BUILD_ROLE_ARN       SST: MICROVM_BUILD_ROLE_ARN
+#   vars.AWS_ACCOUNT_ID               account id (for the image ARN)
+# Optional:
+#   vars.MICROVM_IMAGE_NAME           defaults to "broods-sandbox"
+#   vars.MICROVM_BASE_IMAGE_ARN       defaults to the newest managed al2023 base
+#
+# Until those are set the job is skipped, so merging this workflow is safe.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate on required configuration
+        id: gate
+        env:
+          REGION: ${{ vars.MICROVM_REGION }}
+          BUCKET: ${{ vars.MICROVM_ARTIFACT_BUCKET }}
+          BUILD_ROLE: ${{ vars.MICROVM_BUILD_ROLE_ARN }}
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$REGION" ] || [ -z "$BUCKET" ] || [ -z "$BUILD_ROLE" ] || [ -z "$ACCOUNT_ID" ]; then
+            echo "::warning::MicroVM publish skipped — set MICROVM_REGION, MICROVM_ARTIFACT_BUCKET, MICROVM_BUILD_ROLE_ARN, AWS_ACCOUNT_ID first."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.gate.outputs.ready == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.MICROVM_REGION }}
+
+      - name: Package + publish MicroVM image
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          REGION: ${{ vars.MICROVM_REGION }}
+          BUCKET: ${{ vars.MICROVM_ARTIFACT_BUCKET }}
+          BUILD_ROLE: ${{ vars.MICROVM_BUILD_ROLE_ARN }}
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          IMAGE_NAME: ${{ vars.MICROVM_IMAGE_NAME || 'broods-sandbox' }}
+          BASE_OVERRIDE: ${{ vars.MICROVM_BASE_IMAGE_ARN }}
+        run: |
+          set -euo pipefail
+          SHA="${GITHUB_SHA::7}"
+
+          # The code artifact: Dockerfile at the zip root + everything it COPYs.
+          zip -r artifact.zip Dockerfile Cargo.toml Cargo.lock src >/dev/null
+          KEY="microvm-images/${IMAGE_NAME}/${SHA}.zip"
+          aws s3 cp artifact.zip "s3://${BUCKET}/${KEY}"
+          URI="s3://${BUCKET}/${KEY}"
+
+          # Newest managed AL2023 base unless an explicit ARN is pinned.
+          BASE="$BASE_OVERRIDE"
+          if [ -z "$BASE" ]; then
+            BASE=$(aws lambda-microvms list-managed-microvm-images --region "$REGION" \
+              --query 'reverse(sort_by(managedMicrovmImages,&imageArn))[0].imageArn' --output text)
+          fi
+          echo "base image: $BASE"
+
+          HOOKS='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
+          IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:microvm-image:${IMAGE_NAME}"
+
+          if aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" --region "$REGION" >/dev/null 2>&1; then
+            echo "updating existing image (new version) $IMAGE_ARN"
+            aws lambda-microvms update-microvm-image \
+              --image-identifier "$IMAGE_ARN" \
+              --base-image-arn "$BASE" \
+              --build-role-arn "$BUILD_ROLE" \
+              --code-artifact "{\"uri\":\"${URI}\"}" \
+              --hooks "$HOOKS" \
+              --region "$REGION"
+          else
+            echo "creating image $IMAGE_NAME"
+            aws lambda-microvms create-microvm-image \
+              --name "$IMAGE_NAME" \
+              --description "broods agent sandbox (bash/python/node + S3 workspace mount)" \
+              --base-image-arn "$BASE" \
+              --build-role-arn "$BUILD_ROLE" \
+              --code-artifact "{\"uri\":\"${URI}\"}" \
+              --hooks "$HOOKS" \
+              --region "$REGION"
+          fi
+          echo "::notice::MicroVM image published: ${IMAGE_ARN} (artifact ${URI})"

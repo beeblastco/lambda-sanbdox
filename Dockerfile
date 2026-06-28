@@ -7,18 +7,20 @@ COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
 COPY src src
 
-RUN cargo build --release --locked --bin bootstrap
+RUN cargo build --release --locked --bin sandbox-server
 
 
 # ─── Runtime stage ───
-FROM public.ecr.aws/lambda/provided:al2023
+#
+# The AWS Lambda MicroVM managed base image. Lambda boots a Firecracker microVM
+# from this OS, then runs this container's CMD as a long-lived server (no RIE /
+# Runtime API — that was the old Invoke model). See docs/workspace/sandbox/microvm.md.
+FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
-# Pin the RIE version for reproducible builds.
-ARG RIE_VERSION=1.25
-
-# Install everything in a single RUN to reduce layers and image size.
-# Packages: git, jq, tar, gzip, unzip, which, findutils, procps-ng,
-#           python3, python3-pip, shadow-utils, ca-certificates, nodejs.
+# Toolchain the agent's bash/python/node code expects, plus fuse + util-linux so the
+# /run hook can mount the workspace with mountpoint-s3.
+# Packages: git, jq, tar, gzip, unzip, which, findutils, procps-ng, util-linux,
+#           python3, python3-pip, shadow-utils, ca-certificates, fuse, fuse-libs, nodejs.
 RUN dnf install -y \
     git \
     jq \
@@ -28,10 +30,13 @@ RUN dnf install -y \
     which \
     findutils \
     procps-ng \
+    util-linux \
     python3 \
     python3-pip \
     shadow-utils \
     ca-certificates \
+    fuse \
+    fuse-libs \
     && curl -fsSL https://rpm.nodesource.com/setup_22.x | bash - \
     && dnf install -y nodejs \
     && dnf clean all \
@@ -43,9 +48,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && mv /root/.local/bin/uvx /usr/local/bin/uvx
 
 # Install ripgrep — the harness `grep` tool shells out to `rg`. AL2023's default
-# dnf repos don't carry ripgrep, so fetch the official static release binary (same
-# pattern as the RIE download below). x86_64 uses the musl build, aarch64 the gnu
-# build, matching ripgrep's published release targets.
+# dnf repos don't carry ripgrep, so fetch the official static release binary.
 ARG RIPGREP_VERSION=14.1.1
 RUN ARCH=$(uname -m) \
     && if [ "$ARCH" = "x86_64" ]; then RG_TARGET="x86_64-unknown-linux-musl"; \
@@ -58,29 +61,26 @@ RUN ARCH=$(uname -m) \
     && chmod +x /usr/local/bin/rg \
     && rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}"
 
-# Install AWS Lambda Runtime Interface Emulator (RIE) for local testing.
-# RIE auto-detects Lambda vs local mode; in local mode it proxies the Runtime API on port 8080.
+# Install mountpoint-s3 (`mount-s3`). The /run lifecycle hook uses it to mount the
+# namespace-scoped workspace S3 prefix at /mnt/workspaces/<namespace>. This replaces
+# the old S3 Files NFS mount (which lived in the Lambda function config, not the VM).
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi \
-    && curl -Lo /usr/local/bin/aws-lambda-rie \
-    "https://github.com/aws/aws-lambda-runtime-interface-emulator/releases/download/${RIE_VERSION}/aws-lambda-rie-${ARCH}" \
-    && chmod +x /usr/local/bin/aws-lambda-rie
+    && if [ "$ARCH" = "x86_64" ]; then MS3_ARCH="x86_64"; \
+       elif [ "$ARCH" = "aarch64" ]; then MS3_ARCH="arm64"; \
+       else echo "unsupported arch for mountpoint-s3: $ARCH" && exit 1; fi \
+    && curl -fsSL -o /tmp/mount-s3.rpm \
+       "https://s3.amazonaws.com/mountpoint-s3-release/latest/${MS3_ARCH}/mount-s3.rpm" \
+    && dnf install -y /tmp/mount-s3.rpm \
+    && dnf clean all \
+    && rm -f /tmp/mount-s3.rpm
 
-# Copy the compiled bootstrap binary and make it executable.
-COPY --from=builder /build/target/release/bootstrap /var/runtime/bootstrap
-RUN chmod +x /var/runtime/bootstrap \
-    && mkdir -p /tmp/agent-workspace
+# Copy the compiled server binary.
+COPY --from=builder /build/target/release/sandbox-server /usr/local/bin/sandbox-server
+RUN chmod +x /usr/local/bin/sandbox-server \
+    && mkdir -p /tmp/agent-workspace /mnt/workspaces
 
-# ─── ENTRYPOINT ───
-#
-# Production (AWS Lambda):           ENTRYPOINT ["/var/runtime/bootstrap"]
-# Local testing (with RIE emulator): ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "/var/runtime/bootstrap"]
-#
-# In AWS Lambda, the Runtime API is provided natively — RIE only emulates it
-# for local Docker runs and is not needed in production. When deploying to
-# Lambda, ensure only the production entrypoint is active.
-#
-# ── Production (active) ──
-ENTRYPOINT ["/var/runtime/bootstrap"]
-# ── Testing (comment production above, uncomment below) ──
-# ENTRYPOINT ["/usr/local/bin/aws-lambda-rie", "/var/runtime/bootstrap"]
+# The exec API (8080, proxied from external 443) and the lifecycle hooks (9000) must
+# both be exposed — Lambda calls hooks over the guest network namespace.
+EXPOSE 8080 9000
+
+CMD ["/usr/local/bin/sandbox-server"]

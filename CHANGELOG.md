@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-28
+
+### Changed
+
+- **BREAKING: run as an AWS Lambda MicroVM HTTP server instead of a Lambda custom
+  runtime.** A MicroVM runs the container as a long-lived server, so the Lambda
+  Invoke entrypoint (`bootstrap` + the Runtime API / RIE) is gone. The binary is
+  now `sandbox-server`, which listens on:
+  - **`:8080`** — the exec API. `POST /exec` takes the **same** request JSON and
+    returns the **same** response JSON as the old Invoke handler; only the
+    transport changed (broods #78). The MicroVM proxy routes external 443 here.
+  - **`:9000`** — the lifecycle hooks (`/ready`, `/run`, `/resume`, `/suspend`,
+    `/terminate`) under `/aws/lambda-microvms/runtime/v1`.
+- Execs are now serialized with a mutex so the process-wide `cpu_usec` delta is
+  never corrupted by overlapping children (the old RIE handled one request at a
+  time implicitly).
+- Base image switched to `public.ecr.aws/lambda/microvms:al2023-minimal`; the
+  image now ships `mount-s3` + `fuse` and `EXPOSE`s 8080/9000.
+
 ### Added
+
+- **`/run` hook mounts the workspace from S3 with mountpoint-s3.** The harness
+  delivers the namespace-scoped bucket prefix plus short-lived, prefix-scoped STS
+  credentials in `runHookPayload`; the hook mounts it at `/mnt/workspaces/<namespace>`.
+  This replaces the old S3 Files NFS mount (which was Lambda *function* config, not
+  a MicroVM capability). Falls back to the execution role via IMDSv2 when no
+  credentials are passed. `/terminate` unmounts to flush in-flight uploads.
+- `microvm-image.yml` workflow: packages the Dockerfile + sources and creates /
+  versions the MicroVM image (gated on the SST-provisioned build role + artifact
+  bucket).
+
+### Added (carried from the prior unreleased entry)
 
 - Report `cpu_usec` in the response: CPU time (user + system, including
   descendants) charged to the sandboxed run, measured as a delta around the child
