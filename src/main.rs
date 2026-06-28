@@ -1,10 +1,9 @@
 //! HTTP server entrypoint for the AWS Lambda MicroVM sandbox image.
 //!
-//! A MicroVM runs this container as a long-lived server (the old Lambda Invoke
-//! bootstrap is gone). Two listeners, both bound to 0.0.0.0:
+//! A MicroVM runs this container as a long-lived server. Two listeners, both
+//! bound to 0.0.0.0:
 //!   - **:8080** — the exec API the proxy routes external 443 to. `POST /exec`
-//!     takes the same JSON contract the Invoke handler used and returns the same
-//!     response, so the harness's transport change is the only difference.
+//!     takes the sandbox request JSON and returns a structured exec response.
 //!   - **:9000** — the lifecycle hooks Lambda calls (`/run` mounts the workspace
 //!     S3 prefix; `/suspend`/`/terminate` flush it). Configured via `--hooks` at
 //!     image-create time; both ports must be `EXPOSE`d in the Dockerfile.
@@ -12,7 +11,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
-use lambda_agent_sandbox::{mount, run_exec, ExecRequest, ExecResponse};
+use lambda_microvm_agent_sandbox::{mount, run_exec, ExecRequest, ExecResponse};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -76,8 +75,8 @@ async fn health() -> &'static str {
 }
 
 /// `POST /exec` — parse the request, run it under the exec lock, return the result.
-/// Bad JSON yields a 200 + `ok:false` body (unchanged from the Invoke handler) so the
-/// harness gets a structured error rather than an HTTP failure.
+/// Bad JSON yields a 200 + `ok:false` body so the harness gets a structured error
+/// rather than an HTTP failure.
 async fn exec_handler(State(state): State<AppState>, body: String) -> Json<ExecResponse> {
     let req: ExecRequest = match serde_json::from_str(&body) {
         Ok(r) => r,

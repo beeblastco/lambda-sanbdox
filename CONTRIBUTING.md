@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in contributing to **Lambda Agent Sandbox**! This project is a Rust-based AWS Lambda custom runtime for running sandboxed code execution. We welcome contributions of all kinds — bug fixes, features, documentation, and tests.
+Thanks for your interest in contributing to **AWS Lambda MicroVM Agent Sandbox**! This project is a Rust-based AWS Lambda MicroVM HTTP server for running sandboxed code execution. It is MicroVM-only: no Lambda custom runtime, Runtime API, or RIE path is supported. We welcome contributions of all kinds — bug fixes, features, documentation, and tests.
 
 ---
 
@@ -11,7 +11,7 @@ Thanks for your interest in contributing to **Lambda Agent Sandbox**! This proje
 
    ```bash
    git clone https://github.com/beeblastco/lambda-sanbdox.git
-   cd lambda-sanbdox
+   cd lambda-microvm-agent-sandbox
    ```
 
 3. **Ensure you have the MSRV installed** (see `rust-version` in `Cargo.toml` — currently `1.96.0`).
@@ -43,10 +43,10 @@ cargo test
 ### Docker build (optional, for integration testing)
 
 ```bash
-docker build -t lambda-agent-sandbox .
+docker build -t lambda-microvm-agent-sandbox .
 ```
 
-See the [README](./README.md) for instructions on running the Lambda RIE emulator locally.
+See the [README](./README.md) for instructions on running the container locally.
 
 ---
 

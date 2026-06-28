@@ -77,47 +77,42 @@ jobs:
             echo "docker=${{ steps.filter.outputs.docker }}" >> "$GITHUB_OUTPUT"
           fi
 
-  # ─── Parallel Docker build & smoke test (PRs only, image-relevant changes only) ───
+  # ─── Docker build & smoke test (PRs only, image-relevant changes only) ───
   docker-build:
     runs-on: ubuntu-latest
     needs: [rust-checks, changes]
     if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
+    env:
+      DOCKER_PLATFORM: linux/arm64
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up QEMU
-        if: matrix.platform == 'linux/arm64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - name: Build ${{ matrix.platform }} image
-        uses: docker/build-push-action@v6
+      - name: Build arm64 image
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
           load: true
-          tags: lambda-agent-sandbox:local
+          tags: lambda-microvm-agent-sandbox:local
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ env.DOCKER_PLATFORM }}
           provenance: false
           sbom: false
 
-      - name: Smoke test (amd64 only)
-        if: matrix.platform == 'linux/amd64'
+      - name: Smoke test
         run: |
-          # The image now runs the long-lived HTTP server (sandbox-server) directly:
-          # exec API on 8080, lifecycle hooks on 9000. A stateless bash/node/python
-          # exec needs no fuse/privileges, so a plain docker run exercises it.
-          docker run -d --name sandbox-smoke -p 8080:8080 -p 9000:9000 lambda-agent-sandbox:local
+          # The Lambda MicroVM base image is arm64-only. GitHub's x64 runners run
+          # this container through QEMU, which is enough for the stateless smoke test.
+          docker run -d --name sandbox-smoke -p 8080:8080 -p 9000:9000 lambda-microvm-agent-sandbox:local
           sleep 4
           # Lifecycle /ready hook is up (200).
           curl -fsS -X POST "http://localhost:9000/aws/lambda-microvms/runtime/v1/ready" -o /dev/null
@@ -127,7 +122,7 @@ jobs:
             -d '{"runtime":"bash","code":"echo hello; node -v; python3 --version","timeout_ms":30000}' | grep '"ok":true'
           docker rm -f sandbox-smoke
 
-  # ─── Parallel per-platform build & push to every ECR_REGIONS region + GHCR (main only) ───
+  # ─── Arm64 build & push to every ECR_REGIONS region + GHCR (main only) ───
   build-platform:
     runs-on: ubuntu-latest
     needs: [rust-checks, changes]
@@ -136,19 +131,16 @@ jobs:
       contents: read
       packages: write
       id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
+    env:
+      DOCKER_PLATFORM: linux/arm64
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up QEMU
-        if: matrix.platform == 'linux/arm64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -157,7 +149,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -200,15 +192,15 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ steps.targets.outputs.images }}
           tags: |
-            type=sha,prefix=,suffix=-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
-            type=raw,value=latest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }},enable={{is_default_branch}}
+            type=sha,prefix=,suffix=-arm64
+            type=raw,value=latest-arm64,enable={{is_default_branch}}
 
-      - name: Build and push ${{ matrix.platform }}
-        uses: docker/build-push-action@v6
+      - name: Build and push arm64 image
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -216,11 +208,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ env.DOCKER_PLATFORM }}
           provenance: false
           sbom: false
 
-  # ─── Combine per-platform images into multi-arch manifests, per registry (main only) ───
+  # ─── Create default arm64 aliases, per registry (main only) ───
   create-manifest:
     runs-on: ubuntu-latest
     needs: [build-platform]
@@ -231,7 +223,7 @@ jobs:
       id-token: write
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -240,38 +232,36 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifests
+      - name: Create and push default arm64 aliases
         env:
           AWS_ACCOUNT_ID_VAR: ${{ vars.AWS_ACCOUNT_ID }}
           AWS_ACCOUNT_ID_SECRET: ${{ secrets.AWS_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           # build-platform tags with docker/metadata-action `type=sha`, which is the
-          # SHORT (7-char) sha — so the per-arch tags are e.g. `<short>-amd64`. Match it
-          # here; using the full github.sha looks up a tag that was never pushed. The
-          # per-arch `latest-amd64`/`latest-arm64` tags stay plain single-arch manifests
-          # (Lambda pins `latest-arm64`); only `latest`/`<sha>` become multi-arch indexes.
+          # SHORT (7-char) sha. The MicroVM managed base currently publishes only
+          # linux/arm64, so the default tags are aliases of the arm64 image.
           SHA="${GITHUB_SHA::7}"
 
           combine() { # <repo-base>
             local base="$1"
             for tag in "$SHA" latest; do
               docker buildx imagetools create -t "${base}:${tag}" \
-                "${base}:${tag}-amd64" "${base}:${tag}-arm64"
+                "${base}:${tag}-arm64"
               docker buildx imagetools inspect "${base}:${tag}"
             done
           }
 
-          # ── GHCR manifests (once) ──
+          # ── GHCR aliases (once) ──
           combine "${REGISTRY}/${IMAGE_NAME}"
 
-          # ── ECR manifests (per existing ECR_REGIONS region) ──
+          # ── ECR aliases (per existing ECR_REGIONS region) ──
           ACCOUNT_ID="${AWS_ACCOUNT_ID_VAR:-${AWS_ACCOUNT_ID_SECRET:-}}"
           if [ -z "$ACCOUNT_ID" ]; then
             echo "::error::AWS_ACCOUNT_ID must be set as a repository variable or secret."
@@ -284,7 +274,7 @@ jobs:
             if aws ecr describe-repositories --repository-names "$repo" --region "$region" >/dev/null 2>&1; then
               aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
               combine "${registry}/${repo}"
-              echo "::notice::ECR manifests created in ${region} (${repo})"
+              echo "::notice::ECR aliases created in ${region} (${repo})"
             else
               echo "::warning::Skipping ECR ${region}: repo ${repo} does not exist."
             fi

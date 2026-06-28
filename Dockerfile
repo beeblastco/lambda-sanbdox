@@ -12,9 +12,9 @@ RUN cargo build --release --locked --bin sandbox-server
 
 # ─── Runtime stage ───
 #
-# The AWS Lambda MicroVM managed base image. Lambda boots a Firecracker microVM
-# from this OS, then runs this container's CMD as a long-lived server (no RIE /
-# Runtime API — that was the old Invoke model). See docs/workspace/sandbox/microvm.md.
+# The AWS Lambda MicroVM managed base image. Lambda boots a Firecracker MicroVM
+# from this OS, then runs this container's CMD as a long-lived server. This is
+# not a Lambda custom runtime, RIE, or Runtime API image.
 FROM public.ecr.aws/lambda/microvms:al2023-minimal
 
 # Toolchain the agent's bash/python/node code expects, plus fuse + util-linux so the
@@ -51,8 +51,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 # dnf repos don't carry ripgrep, so fetch the official static release binary.
 ARG RIPGREP_VERSION=14.1.1
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then RG_TARGET="x86_64-unknown-linux-musl"; \
-       elif [ "$ARCH" = "aarch64" ]; then RG_TARGET="aarch64-unknown-linux-gnu"; \
+    && if [ "$ARCH" = "aarch64" ]; then RG_TARGET="aarch64-unknown-linux-gnu"; \
        else echo "unsupported arch for ripgrep: $ARCH" && exit 1; fi \
     && curl -fsSL -o /tmp/rg.tar.gz \
        "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}.tar.gz" \
@@ -62,11 +61,9 @@ RUN ARCH=$(uname -m) \
     && rm -rf /tmp/rg.tar.gz "/tmp/ripgrep-${RIPGREP_VERSION}-${RG_TARGET}"
 
 # Install mountpoint-s3 (`mount-s3`). The /run lifecycle hook uses it to mount the
-# namespace-scoped workspace S3 prefix at /mnt/workspaces/<namespace>. This replaces
-# the old S3 Files NFS mount (which lived in the Lambda function config, not the VM).
+# namespace-scoped workspace S3 prefix at /mnt/workspaces/<namespace>.
 RUN ARCH=$(uname -m) \
-    && if [ "$ARCH" = "x86_64" ]; then MS3_ARCH="x86_64"; \
-       elif [ "$ARCH" = "aarch64" ]; then MS3_ARCH="arm64"; \
+    && if [ "$ARCH" = "aarch64" ]; then MS3_ARCH="arm64"; \
        else echo "unsupported arch for mountpoint-s3: $ARCH" && exit 1; fi \
     && curl -fsSL -o /tmp/mount-s3.rpm \
        "https://s3.amazonaws.com/mountpoint-s3-release/latest/${MS3_ARCH}/mount-s3.rpm" \

@@ -1,12 +1,14 @@
-# Lambda MicroVM Agent Sandbox
+# AWS Lambda MicroVM Agent Sandbox
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.96.0-orange?logo=rust)](https://www.rust-lang.org)
-[![Architecture](https://img.shields.io/badge/architecture-arm64%20%7C%20amd64-blue?logo=docker)](https://www.docker.com)
+[![Architecture](https://img.shields.io/badge/architecture-arm64-blue?logo=docker)](https://www.docker.com)
 
-A Rust **HTTP server**, packaged as an [AWS Lambda MicroVM](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html) image, that executes arbitrary code in a Firecracker-isolated environment. Supports `bash`, `python`, and `node` with timeout enforcement, output capture, and an S3-backed persistent workspace.
+A Rust **HTTP server** packaged specifically for [AWS Lambda MicroVMs](https://docs.aws.amazon.com/lambda/latest/dg/microvms-how-it-works.html). It executes arbitrary code inside a Firecracker-isolated MicroVM with `bash`, `python`, and `node`, timeout enforcement, output capture, and an S3-backed persistent workspace.
 
-> **Migration note (v0.2):** this used to be a Lambda *custom runtime* invoked per request (`bootstrap` + the Runtime API / RIE). A MicroVM instead runs the container as a **long-lived server**, so the binary is now `sandbox-server` and the wire protocol is HTTP. The exec request/response JSON is unchanged — only the transport moved from Invoke to `POST /exec`.
+This repository targets **AWS Lambda MicroVMs only**. It is not an AWS Lambda function custom runtime, not a Lambda Runtime API/RIE project, and not a general-purpose multi-architecture container image. Local Docker builds exist only to reproduce and smoke-test the same arm64 container that Lambda MicroVMs build, snapshot, and run.
+
+> **Migration note (v0.2):** this used to be a Lambda *custom runtime* invoked per request (`bootstrap` + the Runtime API / RIE). It now only supports the AWS Lambda MicroVM model: Lambda builds a MicroVM image from this source artifact, snapshots the running server, and resumes MicroVM instances from that image. The binary is `sandbox-server` and the wire protocol is HTTP.
 
 ---
 
@@ -38,9 +40,9 @@ A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which l
 | ---- | ------- | ------- |
 | [Rust](https://rustup.rs/) | 1.80+ | Build the `sandbox-server` binary |
 | [Docker](https://docs.docker.com/get-docker/) | 24+ | Build and run the container locally |
-| [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | 2.x | Deploy to Lambda (optional) |
+| [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | 2.x | Publish and run Lambda MicroVM images |
 
-> **Note:** The project builds for both `linux/amd64` and `linux/arm64`. Docker Desktop handles cross-arch builds automatically on macOS. The CI pipeline produces multi-arch images for both platforms.
+> **Note:** The Lambda MicroVM managed base image currently publishes `linux/arm64`, so Docker builds and CI target arm64. Docker Desktop and CI runners can run the image through emulation when the host is amd64.
 
 ---
 
@@ -50,7 +52,7 @@ A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which l
 
 ```bash
 git clone <repo-url>
-cd lambda-agent-sandbox
+cd lambda-microvm-agent-sandbox
 ```
 
 ### 2. Build the Rust binary
@@ -77,7 +79,7 @@ cargo test
 ## Build the Docker Image
 
 ```bash
-docker build -t lambda-agent-sandbox .
+docker build -t lambda-microvm-agent-sandbox .
 ```
 
 The Dockerfile is a multi-stage build:
@@ -94,8 +96,8 @@ The image runs the same `sandbox-server` locally as it does inside a MicroVM, so
 ### Start the container
 
 ```bash
-docker build -t lambda-agent-sandbox .
-docker run -d --name sandbox -p 8080:8080 -p 9000:9000 lambda-agent-sandbox
+docker build -t lambda-microvm-agent-sandbox .
+docker run -d --name sandbox -p 8080:8080 -p 9000:9000 lambda-microvm-agent-sandbox
 sleep 3
 ```
 
@@ -160,28 +162,27 @@ the manual equivalent:
 ```bash
 # 1. Package the code artifact (Dockerfile at the zip root + everything it COPYs)
 zip -r artifact.zip Dockerfile Cargo.toml Cargo.lock src
-aws s3 cp artifact.zip "s3://${ARTIFACT_BUCKET}/microvm-images/broods-sandbox/$(git rev-parse --short HEAD).zip"
+aws s3 cp artifact.zip "s3://${ARTIFACT_BUCKET}/microvm-images/lambda-microvm-agent-sandbox/$(git rev-parse --short HEAD).zip"
 
 # 2. Create (first time) the image, declaring the lifecycle hooks on port 9000
 aws lambda-microvms create-microvm-image \
-  --name broods-sandbox \
+  --name lambda-microvm-agent-sandbox \
   --base-image-arn "$(aws lambda-microvms list-managed-microvm-images \
       --query 'reverse(sort_by(managedMicrovmImages,&imageArn))[0].imageArn' --output text)" \
   --build-role-arn "$MICROVM_BUILD_ROLE_ARN" \
-  --code-artifact '{"uri":"s3://.../broods-sandbox/<sha>.zip"}' \
+  --code-artifact '{"uri":"s3://.../lambda-microvm-agent-sandbox/<sha>.zip"}' \
   --hooks '{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
 
 # 3. Ship new code as a new version
 aws lambda-microvms update-microvm-image \
-  --image-identifier "arn:aws:lambda:<region>:<account>:microvm-image:broods-sandbox" \
+  --image-identifier "arn:aws:lambda:<region>:<account>:microvm-image:lambda-microvm-agent-sandbox" \
   --base-image-arn "<base>" --build-role-arn "$MICROVM_BUILD_ROLE_ARN" \
-  --code-artifact '{"uri":"s3://.../broods-sandbox/<sha>.zip"}' --hooks '<same as above>'
+  --code-artifact '{"uri":"s3://.../lambda-microvm-agent-sandbox/<sha>.zip"}' --hooks '<same as above>'
 ```
 
-The build role, artifact bucket, and execution role are provisioned by the broods
-SST app (`apps/core/sst.config.ts`, gated behind `microvmPrereqsEnabled`). The
-harness then runs MicroVMs from this image via `MICROVM_IMAGE_IDENTIFIER`. See the
-broods `docs/workspace/sandbox/microvm.md` for the full operator flow.
+The build role, artifact bucket, and execution role must exist in the same region
+as the MicroVM image. Downstream infrastructure should run MicroVMs from this image
+via `MICROVM_IMAGE_IDENTIFIER`.
 
 ---
 
@@ -219,7 +220,7 @@ broods `docs/workspace/sandbox/microvm.md` for the full operator flow.
 
 ### Ephemeral (default)
 
-When `namespace` is **not** set, each invocation gets a fresh directory under `/tmp/agent-workspace/<uuid>/`. It is deleted automatically after the call. Good for stateless one-shot scripts.
+When `namespace` is **not** set, each exec request gets a fresh directory under `/tmp/agent-workspace/<uuid>/`. It is deleted automatically after the call. Good for stateless one-shot scripts.
 
 ```json
 {
@@ -230,7 +231,7 @@ When `namespace` is **not** set, each invocation gets a fresh directory under `/
 
 ### Persistent (namespace)
 
-When `namespace` is set, the Lambda uses `{workspace_root}/{namespace}` as the working directory and **never cleans it up**. Files written in one call are still there in the next.
+When `namespace` is set, the MicroVM uses `{workspace_root}/{namespace}` as the working directory and **never cleans it up**. Files written in one call are still there in the next.
 
 ```json
 {
@@ -254,13 +255,13 @@ Then in the next call:
 { "ok": true, "stdout": "hello\n", ... }
 ```
 
-The namespace must match `fs-[a-f0-9]{40}`. When this Lambda is deployed with an S3 Files filesystem mount (e.g. via SST with `fileSystemConfig`), the workspace directory maps directly to that mount, so files persist in S3 across cold starts and Lambda replacements.
+The namespace must match `fs-[a-f0-9]{40}`. In the MicroVM deployment path, the `/run` hook mounts the namespace-scoped S3 workspace with mountpoint-s3, so files persist in S3 across MicroVM suspend/resume and replacement.
 
 `workspace_root` overrides where namespaced workspaces are rooted. The default is the `SANDBOX_WORKSPACE_MOUNT_PATH` environment variable (set by SST to `/mnt/workspaces`) or `/mnt/workspaces` if the variable is absent.
 
 #### Write durability
 
-After a persistent run finishes, the handler calls `sync(2)` to flush all dirty page-cache writes to the S3 Files mount before the Lambda freezes. This makes files written by the script — including plain shell redirection like `echo data > out.txt` — durable across a later cold container, not just the page cache of the current invocation.
+After a persistent run finishes, the handler calls `sync(2)` to flush all dirty page-cache writes to the S3 mount before the MicroVM suspends or terminates. This makes files written by the script, including plain shell redirection like `echo data > out.txt`, durable across a later MicroVM.
 
 The runtime script itself (`main.sh`/`main.py`/`main.js`) runs from the workspace — so `python`/`node` relative imports resolve against it as before — and is then removed after the run, so persistent workspaces never accumulate it.
 
@@ -269,7 +270,7 @@ The runtime script itself (`main.sh`/`main.py`/`main.js`) runs from the workspac
 ## Security Notes
 
 - **Workspace isolation:** Ephemeral runs get a fresh UUID-named directory under `/tmp/agent-workspace/`. It is deleted after execution. Persistent runs use a stable namespace path and are never cleaned up by the handler.
-- **Credential isolation:** The child process environment is cleared (`env_clear()`) before setting explicit variables. AWS Lambda credentials are **not** leaked into sandbox code.
+- **Credential isolation:** The child process environment is cleared (`env_clear()`) before setting explicit variables. MicroVM execution-role credentials are **not** leaked into sandbox code.
 - **Input limits:** Code is capped at 10 MB, environment variables at 256 KB total, and arguments at 64 items / 64 KB total.
 - **Timeout enforcement:** Uses `tokio::time::timeout` with `kill_on_drop` to terminate the child process if it exceeds the limit. Maximum configurable timeout is **300 seconds** (5 minutes).
 - **Known limitation:** On timeout, `kill_on_drop` terminates the direct `bash` child but does not reliably kill grandchild processes spawned by the script. A production-hardened version should use process groups (`setpgid`) and kill the entire group.
@@ -278,7 +279,7 @@ The runtime script itself (`main.sh`/`main.py`/`main.js`) runs from the workspac
 
 ## Shell Quoting with `curl`
 
-When sending JSON with `curl -d`, your shell interprets the outer quotes **before** the JSON ever reaches the Lambda function. A common mistake is nesting single quotes inside a single-quoted shell string:
+When sending JSON with `curl -d`, your shell interprets the outer quotes **before** the JSON ever reaches the MicroVM HTTP server. A common mistake is nesting single quotes inside a single-quoted shell string:
 
 ```bash
 # ❌ BROKEN — bash terminates the string at the inner '
@@ -328,7 +329,7 @@ curl -d '{
       -d "{\"runtime\":\"bash\",\"code\":\"echo 'hello from bash'\",\"timeout_ms\":30000}"
     ```
 
-> **Remember:** The Lambda function *is* running bash behind the scenes, but the JSON must be valid **before** it gets there. The error `EOF while parsing a string` is a JSON deserialization failure in the Lambda Runtime, not a bash error.
+> **Remember:** the MicroVM server runs bash behind the scenes, but the JSON must be valid **before** it gets there. The error `EOF while parsing a string` is a JSON deserialization failure in the HTTP request body, not a bash error.
 
 ---
 
@@ -352,14 +353,14 @@ This repository uses **GitHub Actions** for continuous integration and delivery.
 ### On every Pull Request
 
 - **Rust checks:** `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`
-- **Docker build:** Multi-arch image (`linux/amd64`, `linux/arm64`) with layer caching
+- **Docker build:** Arm64 image (`linux/arm64`) with layer caching
 - **Smoke test:** Starts the container and verifies `/ready` (200) + a stateless `POST /exec` returns `ok:true`
 
 ### On push to `main`
 
 - All PR checks run first
 - **MicroVM image publish** ([`microvm-image.yml`](.github/workflows/microvm-image.yml)): zips the Dockerfile + sources, uploads to the SST-provisioned artifact bucket, and creates/versions the MicroVM image (skipped until the required repo vars/secrets are set)
-- The multi-arch container image is also pushed to GHCR/ECR for local reproducibility
+- The arm64 container image is also pushed to GHCR/ECR for local reproducibility
 
 ### Workflow files
 

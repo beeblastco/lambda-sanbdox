@@ -14,7 +14,7 @@ name: MicroVM image
 #   vars.MICROVM_BUILD_ROLE_ARN       SST: MICROVM_BUILD_ROLE_ARN
 #   vars.AWS_ACCOUNT_ID               account id (for the image ARN)
 # Optional:
-#   vars.MICROVM_IMAGE_NAME           defaults to "broods-sandbox"
+#   vars.MICROVM_IMAGE_NAME           defaults to "lambda-microvm-agent-sandbox"
 #   vars.MICROVM_BASE_IMAGE_ARN       defaults to the newest managed al2023 base
 #
 # Until those are set the job is skipped, so merging this workflow is safe.
@@ -68,7 +68,7 @@ jobs:
           BUCKET: ${{ vars.MICROVM_ARTIFACT_BUCKET }}
           BUILD_ROLE: ${{ vars.MICROVM_BUILD_ROLE_ARN }}
           ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-          IMAGE_NAME: ${{ vars.MICROVM_IMAGE_NAME || 'broods-sandbox' }}
+          IMAGE_NAME: ${{ vars.MICROVM_IMAGE_NAME || 'lambda-microvm-agent-sandbox' }}
           BASE_OVERRIDE: ${{ vars.MICROVM_BASE_IMAGE_ARN }}
         run: |
           set -euo pipefail
@@ -104,7 +104,7 @@ jobs:
             echo "creating image $IMAGE_NAME"
             aws lambda-microvms create-microvm-image \
               --name "$IMAGE_NAME" \
-              --description "broods agent sandbox (bash/python/node + S3 workspace mount)" \
+              --description "AWS Lambda MicroVM agent sandbox (bash/python/node + S3 workspace mount)" \
               --base-image-arn "$BASE" \
               --build-role-arn "$BUILD_ROLE" \
               --code-artifact "{\"uri\":\"${URI}\"}" \

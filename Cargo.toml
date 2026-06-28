@@ -1,5 +1,5 @@
 [package]
-name = "lambda-agent-sandbox"
+name = "lambda-microvm-agent-sandbox"
 version = "0.2.0"
 edition = "2021"
 rust-version = "1.96.0"

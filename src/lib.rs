@@ -1,10 +1,10 @@
 //! Agent sandbox — core exec engine for the AWS Lambda MicroVM sandbox image.
 //!
 //! Spawns bash/python/node subprocesses in isolated workspaces, captures output,
-//! enforces timeouts, and returns structured JSON responses. Transport-agnostic:
-//! `run_exec` is driven by the long-lived HTTP server in `main.rs` (`POST /exec`),
-//! which replaced the old Lambda Invoke entrypoint. The persistent-workspace S3
-//! mount is set up by the `/run` lifecycle hook via the [`mount`] module.
+//! enforces timeouts, and returns structured JSON responses. `run_exec` is driven
+//! by the long-lived MicroVM HTTP server in `main.rs` (`POST /exec`). The
+//! persistent-workspace S3 mount is set up by the `/run` lifecycle hook via the
+//! [`mount`] module.
 //!
 //! Workspace modes:
 //!   - Persistent: `namespace` provided → uses `{workspace_root}/{namespace}`, never cleaned up.
@@ -40,7 +40,7 @@ pub struct ExecRequest {
     pub code: String,
 
     /// Workspace namespace (`fs-[a-f0-9]{40}`). When set, uses a persistent workspace
-    /// at `{workspace_root}/{namespace}` backed by the S3 Files mount. When omitted,
+    /// at `{workspace_root}/{namespace}` backed by the MicroVM S3 mount. When omitted,
     /// an ephemeral /tmp workspace is used and cleaned up after the call.
     #[serde(default)]
     pub namespace: Option<String>,
@@ -140,8 +140,7 @@ fn error_response(
 /// Run one exec request end to end: resolve the workspace, create it, execute the
 /// code, and clean up an ephemeral workspace afterwards. Internal failures are
 /// mapped into an `ok: false` ExecResponse (this never returns an Err) so the HTTP
-/// layer always has a structured body to send back — identical semantics to the
-/// old Lambda Invoke handler, just without the Lambda envelope.
+/// layer always has a structured body to send back from the MicroVM HTTP endpoint.
 pub async fn run_exec(req: ExecRequest) -> ExecResponse {
     let started = Instant::now();
 
@@ -300,13 +299,13 @@ async fn execute_request(
     let _ = fs::remove_file(&script_path).await;
 
     // Flush the bash tool's workspace writes (and the script removal above) to the
-    // S3 Files mount before the Lambda freezes. Without this, files written via
-    // shell redirection live only in the page cache and are silently lost on the
-    // next cold container (issue #46). Ephemeral workspaces are deleted right
-    // after the run, so skip them.
+    // S3 mount before the MicroVM suspends or terminates. Without this, files
+    // written via shell redirection can live only in the page cache and be lost on
+    // a replacement MicroVM. Ephemeral workspaces are deleted right after the run,
+    // so skip them.
     //
     // STOPGAP: this is a coarse per-run flush that only prevents silent data loss
-    // on cold containers — it does not address cross-provider durability, hop-2
+    // on replacement MicroVMs — it does not address cross-provider durability, hop-2
     // S3 visibility lag, or multi-agent write conflicts. The intended final fix is
     // a unified shared-data layer (Archil-style elastic POSIX FS, mountable across
     // sandboxes) that owns durability + conflict resolution in one place. Tracked
@@ -355,8 +354,8 @@ async fn execute_request(
 
 /// CPU time charged to this execution environment so far, in microseconds. Read
 /// once before and once after a child runs; the delta is that child's CPU time
-/// (the Lambda runs exactly one child per invocation and blocks on it, so the
-/// runtime's own CPU between the two reads is negligible).
+/// (the server serializes execs and blocks on each child, so the runtime's own CPU
+/// between the two reads is negligible).
 ///
 /// Prefers the cgroup v2 `cpu.stat` `usage_usec` counter, which the kernel tracks
 /// at microsecond resolution from the scheduler's runtime accounting, so even a
