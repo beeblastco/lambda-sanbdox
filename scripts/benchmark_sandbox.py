@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-Lambda Agent Sandbox — Comprehensive Benchmark & Test Suite
+AWS Lambda MicroVM Agent Sandbox — Comprehensive Benchmark & Test Suite
 ─────────────────────────────────────────────────────────────
 Runs 50+ test cases across all runtimes (bash, python, node),
 validates output, measures performance, and generates a
 professional markdown report.
 
 Usage:
+    # Recommended: call a running MicroVM endpoint, with auth/proxy headers
+    # supplied by the caller or an ingress wrapper.
+    python3 scripts/benchmark_sandbox.py \\
+        --url https://<microvm-endpoint>/exec \\
+        --output report.md \\
+        --json-output results.json
+
+    # Legacy compatibility: invoke an older Lambda function wrapper.
     python3 scripts/benchmark_sandbox.py \\
         --function arn:aws:lambda:eu-central-1:403012596812:function:test-lambda-sandbox \\
         --region eu-central-1 \\
-        --profile default \\
-        --warmup 3 \\
-        --output report.md \\
-        --json-output results.json
-
-    # With Function URL instead (no AWS CLI needed):
-    python3 scripts/benchmark_sandbox.py \\
-        --url https://xxx.lambda-url.eu-central-1.on.aws/ \\
-        --output report.md \\
-        --json-output results.json
+        --profile default
 
     # With .env file for config (create ./.env):
-    #   FUNCTION_ARN=arn:aws:lambda:...
+    #   MICROVM_EXEC_URL=https://<microvm-endpoint>/exec
     #   REGION=eu-central-1
     #   PROFILE=default
     #   WARMUP=3
@@ -31,8 +30,8 @@ Usage:
 
 Requirements:
     - Python 3.8+
-    - aws CLI installed & configured (for --function mode)
-    - requests library (for --url mode): pip install requests
+    - requests library for --url mode: pip install requests
+    - aws CLI installed & configured only for legacy --function mode
 """
 
 import json
@@ -99,7 +98,7 @@ def _apply_env_to_args(args, env: dict) -> None:
     # Only set if the CLI value is the default (i.e., not explicitly provided)
     if not args.function and not args.url:
         fn = env.get("FUNCTION_ARN") or env.get("LAMBDA_FUNCTION_ARN")
-        url = env.get("URL") or env.get("LAMBDA_URL")
+        url = env.get("MICROVM_EXEC_URL") or env.get("URL") or env.get("LAMBDA_URL")
         if fn:
             args.function = fn
         elif url:
@@ -118,7 +117,7 @@ def _apply_env_to_args(args, env: dict) -> None:
 #  Test registry – each test is a dict with:
 #    name        : short identifier
 #    description : human-readable label
-#    payload     : dict sent as the Lambda event
+#    payload     : dict sent to POST /exec
 #    check       : callable(response) → (bool, str)  (pass? , detail)
 #    category    : grouping label
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -525,7 +524,7 @@ test(
 
 test(
     name="sec_workspace",
-    description="Unique UUID workspace per invocation",
+    description="Unique UUID workspace per exec request",
     payload={"runtime": "bash", "code": "pwd", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True
                      and "/tmp/agent-workspace/" in r.get("stdout", ""),
@@ -1499,7 +1498,7 @@ BENCHMARKS = [
 
 def invoke_aws_cli(function_arn: str, region: str, profile: str,
                     payload: dict) -> dict:
-    """Invoke Lambda via `aws lambda invoke` CLI and return parsed response."""
+    """Invoke a legacy Lambda wrapper via `aws lambda invoke` CLI."""
     import tempfile
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(payload, f)
@@ -1538,7 +1537,7 @@ def invoke_aws_cli(function_arn: str, region: str, profile: str,
 
 
 def invoke_url(url: str, payload: dict) -> dict:
-    """Invoke Lambda via Function URL using `requests`."""
+    """Invoke a MicroVM `/exec` endpoint using `requests`."""
     try:
         import requests  # type: ignore # noqa: F811
     except ImportError:
@@ -1588,10 +1587,10 @@ def generate_report(results: list[dict], bench_results: list[dict],
     def p(t): lines.append(t)
 
     # ── Header ───────────────────────────────────────────────────────────
-    h1("🧪 Lambda Agent Sandbox — Test & Benchmark Report")
+    h1("🧪 AWS Lambda MicroVM Agent Sandbox — Test & Benchmark Report")
     sep()
     p(f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    p(f"**Function:** `{function_arn}`")
+    p(f"**Target:** `{function_arn}`")
     p(f"**Region:** `{region}`")
     p(f"**Total wall time:** `{wall_seconds:.1f}s`")
     sep()
@@ -1698,7 +1697,7 @@ def generate_report(results: list[dict], bench_results: list[dict],
                 all_warm.extend(b["warm_durations_ms"])
         if all_warm:
             warm_avg = sum(all_warm) / len(all_warm)
-            p(f"**Aggregate warm invocation stats** (across {len(all_warm)} runs):")
+            p(f"**Aggregate warm exec stats** (across {len(all_warm)} runs):")
             p(f"- **Average:** `{warm_avg:.0f}ms`")
             p(f"- **Median:** `{median(all_warm):.0f}ms`")
             sorted_warm = sorted(all_warm)
@@ -1794,7 +1793,7 @@ def _build_json_output(results: list[dict], bench_results: list[dict],
 
     return {
         "metadata": {
-            "tool": "lambda-agent-sandbox-benchmark",
+            "tool": "lambda-microvm-agent-sandbox-benchmark",
             "version": "1.0.0",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "wall_time_seconds": round(wall_seconds, 1),
@@ -1842,10 +1841,10 @@ def _build_json_output(results: list[dict], bench_results: list[dict],
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Lambda Agent Sandbox — Benchmark & Test Suite")
+        description="AWS Lambda MicroVM Agent Sandbox — Benchmark & Test Suite")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--function", help="Lambda function ARN")
-    group.add_argument("--url", help="Lambda Function URL (alternative to --function)")
+    group.add_argument("--function", help="Legacy Lambda function ARN wrapper")
+    group.add_argument("--url", help="MicroVM exec URL, usually https://<endpoint>/exec")
     parser.add_argument("--region", default="eu-central-1", help="AWS region")
     parser.add_argument("--profile", default="default", help="AWS CLI profile")
     parser.add_argument("--output", "-o", default="sandbox_report.md",
@@ -1855,7 +1854,7 @@ def main():
     parser.add_argument("--env-file", "-e", metavar="PATH", default=".env",
                         help="Path to .env file with config overrides (default: ./.env)")
     parser.add_argument("--warmup", "-w", type=int, default=2,
-                        help="Number of warmup invocations before benchmarking")
+                        help="Number of warmup exec requests before benchmarking")
     parser.add_argument("--benchmark-runs", "-n", type=int, default=5,
                         help="Benchmark repetitions per test")
     args = parser.parse_args()
@@ -1869,8 +1868,8 @@ def main():
     if not args.function and not args.url:
         parser.error(
             "No target specified. Provide --function, --url, "
-            "or set FUNCTION_ARN/LAMBDA_FUNCTION_ARN or "
-            "URL/LAMBDA_URL in the .env file.")
+            "or set MICROVM_EXEC_URL, URL/LAMBDA_URL, "
+            "or FUNCTION_ARN/LAMBDA_FUNCTION_ARN in the .env file.")
 
     # Set up invoker
     if args.function:
@@ -1883,7 +1882,7 @@ def main():
             return invoke_url(args.url, payload)
         source_desc = args.url
 
-    print("🚀 Lambda Agent Sandbox — Test Suite")
+    print("🚀 AWS Lambda MicroVM Agent Sandbox — Test Suite")
     print(f"   Target: {source_desc}")
     print(f"   Tests:  {len(TESTS)}")
     print(f"   Benchmarks: {len(BENCHMARKS)}")
@@ -1894,7 +1893,7 @@ def main():
 
     # ── Warmup ────────────────────────────────────────────────────────────
     if args.warmup > 0:
-        print(f"🔥 Warming up ({args.warmup}x invocations)...")
+        print(f"🔥 Warming up ({args.warmup}x exec requests)...")
         for i in range(args.warmup):
             resp = invoker({"runtime": "bash", "code": "echo warmup",
                            "timeout_ms": 5000})

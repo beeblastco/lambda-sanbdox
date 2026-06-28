@@ -1,4 +1,4 @@
-use lambda_agent_sandbox::truncate_string;
+use lambda_microvm_agent_sandbox::truncate_string;
 
 #[test]
 fn test_truncate_string_short() {
