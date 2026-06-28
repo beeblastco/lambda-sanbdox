@@ -67,8 +67,7 @@ RUN ARCH=$(uname -m) \
        else echo "unsupported arch for mountpoint-s3: $ARCH" && exit 1; fi \
     && curl -fsSL -o /tmp/mount-s3.rpm \
        "https://s3.amazonaws.com/mountpoint-s3-release/latest/${MS3_ARCH}/mount-s3.rpm" \
-    && cd /tmp \
-    && dnf install -y ./mount-s3.rpm \
+    && rpm -Uvh /tmp/mount-s3.rpm \
     && dnf clean all \
     && rm -f /tmp/mount-s3.rpm
 
