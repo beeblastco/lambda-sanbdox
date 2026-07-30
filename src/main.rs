@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .route(&format!("{HOOK_BASE}/ready"), post(ok_hook))
         .route(&format!("{HOOK_BASE}/validate"), post(ok_hook))
         .route(&format!("{HOOK_BASE}/run"), post(run_hook))
-        .route(&format!("{HOOK_BASE}/resume"), post(resume_hook))
+        .route(&format!("{HOOK_BASE}/resume"), post(ok_hook))
         .route(&format!("{HOOK_BASE}/suspend"), post(suspend_hook))
         .route(&format!("{HOOK_BASE}/terminate"), post(terminate_hook))
         .with_state(state.clone());
@@ -155,23 +155,6 @@ fn hook_failed(hook: &str, error: anyhow::Error) -> (StatusCode, String) {
     eprintln!("{hook}: {message}");
 
     (StatusCode::INTERNAL_SERVER_ERROR, message)
-}
-
-/// `/resume` — mountpoint-s3 does not survive the suspend snapshot, so re-establish
-/// the mount the restored VM was running with. Credentials come from the endpoint,
-/// which the harness refreshes, so a long-suspended VM still mounts.
-async fn resume_hook(State(state): State<AppState>) -> (StatusCode, String) {
-    let workspace = state.workspace.lock().await.clone();
-    let Some(workspace) = workspace else {
-        return (StatusCode::OK, String::new());
-    };
-    match remount(&state, &workspace).await {
-        Ok(point) => {
-            eprintln!("/resume: remounted workspace at {point}");
-            (StatusCode::OK, String::new())
-        }
-        Err(e) => hook_failed("/resume", e),
-    }
 }
 
 /// `GET /workspace/credentials` — the container-credential-provider endpoint
