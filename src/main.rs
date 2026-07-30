@@ -222,8 +222,7 @@ async fn put_credentials_handler(
 
 /// Mount the workspace and record the mount point for `/terminate` to flush.
 async fn remount(state: &AppState, workspace: &Workspace) -> anyhow::Result<String> {
-    let uri = format!("http://127.0.0.1:{CREDENTIALS_PORT}{CREDENTIALS_PATH}");
-    let point = mount::mount_workspace(workspace, &uri, &state.credentials_token).await?;
+    let point = mount::mount_workspace(workspace).await?;
     *state.mount_point.lock().await = Some(point.clone());
 
     Ok(point)

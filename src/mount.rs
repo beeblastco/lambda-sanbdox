@@ -8,9 +8,9 @@
 //! credentials never reach the VM — only the prefix-scoped session credentials do,
 //! and any code the agent runs can read them, so nothing wider may be passed.
 //!
-//! Those sessions expire in an hour, which a persistent VM outlives, so mountpoint-s3
-//! reads them from this server's own credential endpoint instead of static env keys:
-//! it re-fetches as the session ages and the harness keeps the endpoint current.
+//! Those sessions expire in an hour, which a persistent VM outlives. The mount takes
+//! the static keys (the credential endpoint is not reachable during the boot-time
+//! `/run`), and the harness remounts with a fresh session before they expire.
 //!
 //! The mount prefix already encodes the namespace (`<prefix>/<namespace>/`), and the
 //! local mount point also ends in the namespace, so the two stay aligned with the
@@ -20,9 +20,8 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// Path the local credential endpoint is served on. mountpoint-s3 re-fetches from
-/// here whenever its cached session nears expiry, so a mount outlives the one-hour
-/// STS credentials the `/run` payload was minted with.
+/// Path the local credential endpoint is served on. The harness keeps it stocked so
+/// a remount always has a live session to use.
 pub const CREDENTIALS_PATH: &str = "/workspace/credentials";
 
 /// Body of `POST /aws/lambda-microvms/runtime/v1/run`. Lambda injects `microvmId`
@@ -48,9 +47,8 @@ pub struct Mount {
     pub region: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Short-lived STS credentials scoped to `bucket/prefix*`, seeding the local
-    /// credential endpoint. Absent => mountpoint-s3's default chain (the MicroVM
-    /// execution role via IMDSv2).
+    /// Short-lived STS credentials scoped to `bucket/prefix*`. Absent => fall back to
+    /// mountpoint-s3's default chain (the MicroVM execution role via IMDSv2).
     #[serde(default)]
     pub env: Option<MountCredentials>,
 }
@@ -109,13 +107,8 @@ pub fn parse_payload(body: &str) -> anyhow::Result<Option<Workspace>> {
 }
 
 /// Mount `ws.mount.bucket` at `{root}/{namespace}` via mountpoint-s3. Idempotent:
-/// `/run` may be retried, and a path already mounted is left as-is. `creds_uri` /
-/// `creds_token` point mountpoint-s3 at this server's own credential endpoint.
-pub async fn mount_workspace(
-    ws: &Workspace,
-    creds_uri: &str,
-    creds_token: &str,
-) -> anyhow::Result<String> {
+/// `/run` may be retried, and a path already mounted is left as-is.
+pub async fn mount_workspace(ws: &Workspace) -> anyhow::Result<String> {
     let point = mount_point(&ws.root, &ws.namespace);
     tokio::fs::create_dir_all(&point)
         .await
@@ -139,15 +132,19 @@ pub async fn mount_workspace(
         cmd.arg("--endpoint-url").arg(endpoint);
     }
 
-    // Clear inherited env so only the mount's own credential source reaches
-    // mountpoint-s3. Static session keys would strand the mount at their one-hour
-    // expiry, so point it at the local endpoint instead — it re-fetches on its own
-    // clock and the harness keeps that endpoint stocked with fresh credentials.
+    // Clear inherited env so only the scoped mount credentials reach mountpoint-s3.
+    // These are the session's static keys: the credential endpoint is not reachable
+    // during the boot-time `/run`, and a mount that cannot resolve credentials fails
+    // the whole VM. The session expires in an hour, so the harness remounts before
+    // then (see remount on `/resume` and the harness-side refresh).
     cmd.env_clear()
         .env("HOME", "/root")
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("AWS_CONTAINER_CREDENTIALS_FULL_URI", creds_uri)
-        .env("AWS_CONTAINER_AUTHORIZATION_TOKEN", creds_token);
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+    if let Some(creds) = &ws.mount.env {
+        cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
+            .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key)
+            .env("AWS_SESSION_TOKEN", &creds.session_token);
+    }
 
     let output = cmd.output().await.context("spawn mount-s3")?;
     if !output.status.success() {
