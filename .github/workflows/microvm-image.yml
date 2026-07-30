@@ -88,6 +88,9 @@ jobs:
           fi
           echo "base image: $BASE"
 
+          # additionalOsCapabilities ALL is what makes the workspace mount possible:
+          # FUSE needs CAP_SYS_ADMIN, and without it mount-s3 fails with EPERM and the
+          # agent silently writes to the plain directory under the mount point.
           HOOKS='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
           IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:microvm-image:${IMAGE_NAME}"
 
@@ -99,6 +102,7 @@ jobs:
               --build-role-arn "$BUILD_ROLE" \
               --code-artifact "{\"uri\":\"${URI}\"}" \
               --hooks "$HOOKS" \
+              --additional-os-capabilities ALL \
               --region "$REGION"
           else
             echo "creating image $IMAGE_NAME"
@@ -109,6 +113,7 @@ jobs:
               --build-role-arn "$BUILD_ROLE" \
               --code-artifact "{\"uri\":\"${URI}\"}" \
               --hooks "$HOOKS" \
+              --additional-os-capabilities ALL \
               --region "$REGION"
           fi
           echo "::notice::MicroVM image published: ${IMAGE_ARN} (artifact ${URI})"

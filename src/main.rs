@@ -10,8 +10,17 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
-use lambda_microvm_agent_sandbox::{mount, run_exec, ExecRequest, ExecResponse};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::get,
+    routing::post,
+    Json, Router,
+};
+use lambda_microvm_agent_sandbox::{
+    mount::{self, ContainerCredentials, MountCredentials, Workspace, CREDENTIALS_PATH},
+    run_exec, ExecRequest, ExecResponse,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -26,6 +35,14 @@ struct AppState {
     exec_lock: Arc<Mutex<()>>,
     // The workspace mount established by `/run`, so `/terminate` can flush it.
     mount_point: Arc<Mutex<Option<String>>>,
+    // The workspace `/run` mounted, replayed by `/resume`: mountpoint-s3 does not
+    // survive the suspend snapshot, so a restored VM has to mount again.
+    workspace: Arc<Mutex<Option<Workspace>>>,
+    // Latest credentials for the mount, served to mountpoint-s3 and refreshed by the
+    // harness before the previous session expires.
+    credentials: Arc<Mutex<Option<MountCredentials>>>,
+    // Bearer the credential endpoint requires, minted per boot.
+    credentials_token: Arc<String>,
 }
 
 #[tokio::main]
@@ -33,19 +50,26 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         exec_lock: Arc::new(Mutex::new(())),
         mount_point: Arc::new(Mutex::new(None)),
+        workspace: Arc::new(Mutex::new(None)),
+        credentials: Arc::new(Mutex::new(None)),
+        credentials_token: Arc::new(mint_token()),
     };
 
     let exec_app = Router::new()
         .route("/", get(health))
         .route("/healthz", get(health))
         .route("/exec", post(exec_handler))
+        .route(
+            CREDENTIALS_PATH,
+            get(credentials_handler).post(put_credentials_handler),
+        )
         .with_state(state.clone());
 
     let hooks_app = Router::new()
         .route(&format!("{HOOK_BASE}/ready"), post(ok_hook))
         .route(&format!("{HOOK_BASE}/validate"), post(ok_hook))
         .route(&format!("{HOOK_BASE}/run"), post(run_hook))
-        .route(&format!("{HOOK_BASE}/resume"), post(ok_hook))
+        .route(&format!("{HOOK_BASE}/resume"), post(resume_hook))
         .route(&format!("{HOOK_BASE}/suspend"), post(suspend_hook))
         .route(&format!("{HOOK_BASE}/terminate"), post(terminate_hook))
         .with_state(state.clone());
@@ -108,18 +132,82 @@ async fn ok_hook() -> StatusCode {
 /// failure returns 500 so the platform fails the run rather than dropping the agent
 /// into an unmounted local directory where writes would be silently lost.
 async fn run_hook(State(state): State<AppState>, body: String) -> StatusCode {
-    match mount::parse_and_mount(&body).await {
-        Ok(Some(point)) => {
+    let workspace = match mount::parse_payload(&body) {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return StatusCode::OK,
+        Err(e) => {
+            eprintln!("/run: {e:#}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
+    *state.credentials.lock().await = workspace.mount.env.clone();
+    *state.workspace.lock().await = Some(workspace.clone());
+    match remount(&state, &workspace).await {
+        Ok(point) => {
             eprintln!("/run: mounted workspace at {point}");
-            *state.mount_point.lock().await = Some(point);
             StatusCode::OK
         }
-        Ok(None) => StatusCode::OK,
         Err(e) => {
             eprintln!("/run: workspace mount failed: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+/// `/resume` — mountpoint-s3 does not survive the suspend snapshot, so re-establish
+/// the mount the restored VM was running with. Credentials come from the endpoint,
+/// which the harness refreshes, so a long-suspended VM still mounts.
+async fn resume_hook(State(state): State<AppState>) -> StatusCode {
+    let workspace = state.workspace.lock().await.clone();
+    let Some(workspace) = workspace else {
+        return StatusCode::OK;
+    };
+    match remount(&state, &workspace).await {
+        Ok(point) => {
+            eprintln!("/resume: remounted workspace at {point}");
+            StatusCode::OK
+        }
+        Err(e) => {
+            eprintln!("/resume: workspace remount failed: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// `GET /workspace/credentials` — the container-credential-provider endpoint
+/// mountpoint-s3 re-fetches from as its session nears expiry.
+async fn credentials_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ContainerCredentials>, StatusCode> {
+    if !authorized(&headers, &state.credentials_token) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    match state.credentials.lock().await.as_ref() {
+        Some(creds) => Ok(Json(ContainerCredentials::from(creds))),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `POST /workspace/credentials` — the harness replaces the mount's credentials
+/// before the current session expires. No remount: mountpoint-s3 picks these up on
+/// its next refresh.
+async fn put_credentials_handler(
+    State(state): State<AppState>,
+    Json(creds): Json<MountCredentials>,
+) -> StatusCode {
+    *state.credentials.lock().await = Some(creds);
+
+    StatusCode::OK
+}
+
+/// Mount the workspace and record the mount point for `/terminate` to flush.
+async fn remount(state: &AppState, workspace: &Workspace) -> anyhow::Result<String> {
+    let uri = format!("http://127.0.0.1:{EXEC_PORT}{CREDENTIALS_PATH}");
+    let point = mount::mount_workspace(workspace, &uri, &state.credentials_token).await?;
+    *state.mount_point.lock().await = Some(point.clone());
+
+    Ok(point)
 }
 
 /// `/suspend` — flush filesystem buffers before the snapshot. mountpoint-s3 uploads
@@ -136,6 +224,21 @@ async fn terminate_hook(State(state): State<AppState>) -> StatusCode {
     }
     flush();
     StatusCode::OK
+}
+
+/// Per-boot bearer for the credential endpoint. The agent's own code shares this VM
+/// and could read it either way — the token only keeps the endpoint from answering
+/// anything that reaches the port by accident.
+fn mint_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim_start_matches("Bearer ").trim() == token)
+        .unwrap_or(false)
 }
 
 fn flush() {
