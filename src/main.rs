@@ -131,46 +131,46 @@ async fn ok_hook() -> StatusCode {
 /// `/run` — mount the workspace S3 prefix (if the payload carries one). A mount
 /// failure returns 500 so the platform fails the run rather than dropping the agent
 /// into an unmounted local directory where writes would be silently lost.
-async fn run_hook(State(state): State<AppState>, body: String) -> StatusCode {
+async fn run_hook(State(state): State<AppState>, body: String) -> (StatusCode, String) {
     let workspace = match mount::parse_payload(&body) {
         Ok(Some(ws)) => ws,
-        Ok(None) => return StatusCode::OK,
-        Err(e) => {
-            eprintln!("/run: {e:#}");
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
+        Ok(None) => return (StatusCode::OK, String::new()),
+        Err(e) => return hook_failed("/run", e),
     };
     *state.credentials.lock().await = workspace.mount.env.clone();
     *state.workspace.lock().await = Some(workspace.clone());
     match remount(&state, &workspace).await {
         Ok(point) => {
             eprintln!("/run: mounted workspace at {point}");
-            StatusCode::OK
+            (StatusCode::OK, String::new())
         }
-        Err(e) => {
-            eprintln!("/run: workspace mount failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        Err(e) => hook_failed("/run", e),
     }
+}
+
+/// Hook failures are the one thing worth reading back: MicroVM stderr does not always
+/// reach CloudWatch, and a silent mount failure is exactly the bug this guards.
+fn hook_failed(hook: &str, error: anyhow::Error) -> (StatusCode, String) {
+    let message = format!("{error:#}");
+    eprintln!("{hook}: {message}");
+
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 /// `/resume` — mountpoint-s3 does not survive the suspend snapshot, so re-establish
 /// the mount the restored VM was running with. Credentials come from the endpoint,
 /// which the harness refreshes, so a long-suspended VM still mounts.
-async fn resume_hook(State(state): State<AppState>) -> StatusCode {
+async fn resume_hook(State(state): State<AppState>) -> (StatusCode, String) {
     let workspace = state.workspace.lock().await.clone();
     let Some(workspace) = workspace else {
-        return StatusCode::OK;
+        return (StatusCode::OK, String::new());
     };
     match remount(&state, &workspace).await {
         Ok(point) => {
             eprintln!("/resume: remounted workspace at {point}");
-            StatusCode::OK
+            (StatusCode::OK, String::new())
         }
-        Err(e) => {
-            eprintln!("/resume: workspace remount failed: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        Err(e) => hook_failed("/resume", e),
     }
 }
 
