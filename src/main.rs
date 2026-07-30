@@ -1,12 +1,13 @@
 //! HTTP server entrypoint for the AWS Lambda MicroVM sandbox image.
 //!
-//! A MicroVM runs this container as a long-lived server. Two listeners, both
-//! bound to 0.0.0.0:
+//! A MicroVM runs this container as a long-lived server. Three listeners:
 //!   - **:8080** — the exec API the proxy routes external 443 to. `POST /exec`
 //!     takes the sandbox request JSON and returns a structured exec response.
 //!   - **:9000** — the lifecycle hooks Lambda calls (`/run` mounts the workspace
 //!     S3 prefix; `/suspend`/`/terminate` flush it). Configured via `--hooks` at
 //!     image-create time; both ports must be `EXPOSE`d in the Dockerfile.
+//!   - **127.0.0.1:9001** — the credential endpoint mountpoint-s3 re-fetches from.
+//!     Loopback only, and started before the hooks so a boot-time mount can reach it.
 
 use std::sync::Arc;
 
@@ -26,6 +27,10 @@ use tokio::sync::Mutex;
 
 const EXEC_PORT: u16 = 8080;
 const HOOKS_PORT: u16 = 9000;
+// mountpoint-s3 reads credentials from this loopback-only port. It is separate from
+// the exec API and starts before any hook is answered, because `/run` mounts during
+// boot and a mount that cannot reach its credential source fails the whole VM.
+const CREDENTIALS_PORT: u16 = 9001;
 const HOOK_BASE: &str = "/aws/lambda-microvms/runtime/v1";
 
 #[derive(Clone)]
@@ -74,9 +79,23 @@ async fn main() -> anyhow::Result<()> {
         .route(&format!("{HOOK_BASE}/terminate"), post(terminate_hook))
         .with_state(state.clone());
 
+    // Credentials first, and only then the hooks: `/run` mounts during boot, so the
+    // credential endpoint has to be answering before the platform can call it.
+    let credentials_app = Router::new()
+        .route(CREDENTIALS_PATH, get(credentials_handler))
+        .with_state(state.clone());
+    let credentials_listener = TcpListener::bind(("127.0.0.1", CREDENTIALS_PORT)).await?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(credentials_listener, credentials_app).await {
+            eprintln!("credentials server exited: {error}");
+        }
+    });
+
     let exec_listener = TcpListener::bind(("0.0.0.0", EXEC_PORT)).await?;
     let hooks_listener = TcpListener::bind(("0.0.0.0", HOOKS_PORT)).await?;
-    eprintln!("sandbox-server: exec on :{EXEC_PORT}, hooks on :{HOOKS_PORT}");
+    eprintln!(
+        "sandbox-server: exec on :{EXEC_PORT}, hooks on :{HOOKS_PORT}, credentials on :{CREDENTIALS_PORT}"
+    );
 
     // Run both servers; if either exits, propagate so the VM is recycled.
     tokio::try_join!(
@@ -203,7 +222,7 @@ async fn put_credentials_handler(
 
 /// Mount the workspace and record the mount point for `/terminate` to flush.
 async fn remount(state: &AppState, workspace: &Workspace) -> anyhow::Result<String> {
-    let uri = format!("http://127.0.0.1:{EXEC_PORT}{CREDENTIALS_PATH}");
+    let uri = format!("http://127.0.0.1:{CREDENTIALS_PORT}{CREDENTIALS_PATH}");
     let point = mount::mount_workspace(workspace, &uri, &state.credentials_token).await?;
     *state.mount_point.lock().await = Some(point.clone());
 
