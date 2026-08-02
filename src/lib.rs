@@ -241,8 +241,12 @@ async fn execute_request(
 
     let bash_command = match runtime.as_str() {
         "bash" | "sh" => {
+            // Invoked through the interpreter, like python/node below, rather than
+            // chmod +x'd and run directly: the workspace is a mountpoint-s3 FUSE
+            // mount, which rejects chmod outright, and that failure took down every
+            // bash call the moment the mount started working.
             let q = shlex::try_quote(&path_str).map_err(|e| anyhow!("invalid path: {e}"))?;
-            let mut cmd = format!("chmod +x {q} && {q}");
+            let mut cmd = format!("/bin/bash {q}");
             for arg in &req.args {
                 let aq = shlex::try_quote(arg).map_err(|e| anyhow!("invalid arg: {e}"))?;
                 cmd.push(' ');
