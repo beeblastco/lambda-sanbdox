@@ -24,12 +24,16 @@ use tokio::process::Command;
 /// a remount always has a live session to use.
 pub const CREDENTIALS_PATH: &str = "/workspace/credentials";
 
-/// Body of `POST /aws/lambda-microvms/runtime/v1/run`. Lambda injects `microvmId`
-/// alongside the `runHookPayload` we passed to `RunMicrovm`; we only read `workspace`.
+/// Body of `POST /aws/lambda-microvms/runtime/v1/run`. Lambda does not spread what
+/// we handed `RunMicrovm` at the top level — it nests it under `runHookPayload`, as a
+/// JSON *string*, beside `microvmId`. Reading only a top-level `workspace` made every
+/// mount a silent no-op: the hook found nothing to do and answered 200.
 #[derive(Debug, Deserialize)]
 pub struct RunHookPayload {
     #[serde(default)]
     pub workspace: Option<Workspace>,
+    #[serde(default, rename = "runHookPayload")]
+    pub run_hook_payload: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -102,8 +106,20 @@ pub fn mount_point(root: &str, namespace: &str) -> String {
 pub fn parse_payload(body: &str) -> anyhow::Result<Option<Workspace>> {
     let payload: RunHookPayload =
         serde_json::from_str(body).context("invalid /run hook payload json")?;
+    if payload.workspace.is_some() {
+        return Ok(payload.workspace);
+    }
+    let Some(nested) = payload.run_hook_payload else {
+        return Ok(None);
+    };
+    let inner: RunHookPayload = match nested {
+        serde_json::Value::String(raw) => {
+            serde_json::from_str(&raw).context("invalid nested runHookPayload json")?
+        }
+        other => serde_json::from_value(other).context("invalid nested runHookPayload")?,
+    };
 
-    Ok(payload.workspace)
+    Ok(inner.workspace)
 }
 
 /// Mount `ws.mount.bucket` at `{root}/{namespace}` via mountpoint-s3. Idempotent:
@@ -230,8 +246,46 @@ mod tests {
 
     #[test]
     fn stateless_payload_has_no_workspace() {
-        let payload: RunHookPayload =
-            serde_json::from_str(r#"{"microvmId":"microvm-1"}"#).expect("parse");
-        assert!(payload.workspace.is_none());
+        assert!(parse_payload(r#"{"microvmId":"microvm-1"}"#)
+            .expect("parse")
+            .is_none());
+    }
+
+    // The shape Lambda actually delivers. Parsing only the flat one turned every
+    // workspace mount into a silent no-op that still answered 200.
+    #[test]
+    fn parses_the_payload_lambda_nests_as_a_string() {
+        let inner = r#"{"workspace":{"namespace":"fs-abc","root":"/mnt/workspaces","mount":{"bucket":"b","prefix":"fs-abc/"}}}"#;
+        let body =
+            serde_json::json!({ "microvmId": "microvm-1", "runHookPayload": inner }).to_string();
+        let ws = parse_payload(&body).expect("parse").expect("workspace");
+        assert_eq!(ws.mount.bucket, "b");
+        assert_eq!(
+            mount_point(&ws.root, &ws.namespace),
+            "/mnt/workspaces/fs-abc"
+        );
+    }
+
+    #[test]
+    fn parses_the_nested_payload_when_delivered_as_an_object() {
+        let body = serde_json::json!({
+            "microvmId": "microvm-1",
+            "runHookPayload": {
+                "workspace": {
+                    "namespace": "fs-abc",
+                    "root": "/mnt/workspaces",
+                    "mount": { "bucket": "b", "prefix": "fs-abc/" }
+                }
+            }
+        })
+        .to_string();
+        let ws = parse_payload(&body).expect("parse").expect("workspace");
+        assert_eq!(ws.mount.bucket, "b");
+    }
+
+    #[test]
+    fn a_malformed_nested_payload_fails_loudly() {
+        let body = serde_json::json!({ "runHookPayload": "{not json" }).to_string();
+        assert!(parse_payload(&body).is_err());
     }
 }
