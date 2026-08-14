@@ -96,6 +96,17 @@ fn validate_namespace(ns: &str) -> bool {
     hex.len() == 40 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
+fn runtime_script_name(runtime: &str) -> anyhow::Result<String> {
+    let extension = match runtime {
+        "bash" | "sh" => "sh",
+        "python" | "python3" | "py" => "py",
+        "node" | "nodejs" | "js" | "javascript" => "js",
+        other => return Err(anyhow!("unsupported runtime: {other}")),
+    };
+
+    Ok(format!(".broods-exec-{}.{}", Uuid::new_v4(), extension))
+}
+
 fn resolve_workspace(req: &ExecRequest) -> Result<(PathBuf, bool), anyhow::Error> {
     match &req.namespace {
         Some(ns) => {
@@ -220,19 +231,11 @@ async fn execute_request(
 
     let runtime = req.runtime.to_lowercase();
 
-    let script_name = match runtime.as_str() {
-        "bash" | "sh" => "main.sh",
-        "python" | "python3" | "py" => "main.py",
-        "node" | "nodejs" | "js" | "javascript" => "main.js",
-        other => return Err(anyhow!("unsupported runtime: {other}")),
-    };
+    let script_name = runtime_script_name(&runtime)?;
 
-    // The script lives in the workspace so it runs with the same cwd and, for
-    // python/node, the same module-resolution root as the workspace (relative
-    // imports / `require('./x')` resolve against the script's own directory). It
-    // is removed after the run so persistent workspaces never accumulate a
-    // leftover main.sh/main.py/main.js for the model to see (issue #66).
-    let script_path = workspace.join(script_name);
+    // A unique script in the workspace root preserves python/node relative imports
+    // without letting parallel MicroVMs overwrite or remove each other's program.
+    let script_path = workspace.join(&script_name);
     fs::write(&script_path, &req.code)
         .await
         .context("failed to write code file")?;
@@ -298,8 +301,8 @@ async fn execute_request(
     // the parent-side script removal / sync below touch anything.
     let cpu_usec = children_cpu_usec().saturating_sub(cpu_before);
 
-    // Remove the runtime script so it never lingers in a persistent workspace
-    // (issue #66). Best-effort: the sync below flushes the unlink too.
+    // Remove this run's unique script so it never lingers in a persistent workspace.
+    // Best-effort: the sync below flushes the unlink too.
     let _ = fs::remove_file(&script_path).await;
 
     // Flush the bash tool's workspace writes (and the script removal above) to the
@@ -353,6 +356,34 @@ async fn execute_request(
             workspace: workspace.display().to_string(),
             cpu_usec: None,
         }),
+    }
+}
+
+#[cfg(test)]
+mod runtime_script_tests {
+    use super::runtime_script_name;
+
+    #[test]
+    fn creates_unique_hidden_script_names() {
+        let first = runtime_script_name("bash").expect("bash script name");
+        let second = runtime_script_name("bash").expect("bash script name");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(".broods-exec-"));
+        assert!(first.ends_with(".sh"));
+        assert!(runtime_script_name("python3")
+            .expect("python script name")
+            .ends_with(".py"));
+        assert!(runtime_script_name("node")
+            .expect("node script name")
+            .ends_with(".js"));
+    }
+
+    #[test]
+    fn rejects_unsupported_runtimes() {
+        let error = runtime_script_name("ruby").expect_err("unsupported runtime");
+
+        assert_eq!(error.to_string(), "unsupported runtime: ruby");
     }
 }
 
