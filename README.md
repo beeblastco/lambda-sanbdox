@@ -263,7 +263,7 @@ The namespace must match `fs-[a-f0-9]{40}`. In the MicroVM deployment path, the 
 
 After a persistent run finishes, the handler calls `sync(2)` to flush all dirty page-cache writes to the S3 mount before the MicroVM suspends or terminates. This makes files written by the script, including plain shell redirection like `echo data > out.txt`, durable across a later MicroVM.
 
-The runtime script itself (`main.sh`/`main.py`/`main.js`) runs from the workspace — so `python`/`node` relative imports resolve against it as before — and is then removed after the run, so persistent workspaces never accumulate it.
+Each runtime script uses a unique hidden name in the workspace root. This prevents parallel MicroVM executions from overwriting or deleting each other's scripts while preserving `python`/`node` relative imports. The script is removed after its run.
 
 ---
 

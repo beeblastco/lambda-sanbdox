@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Parallel executions against one workspace now use unique hidden runtime script
+  names, preventing one MicroVM from removing another call's program.
 - CI no longer attempts to build an unsupported `linux/amd64` image from the
   arm64-only `public.ecr.aws/lambda/microvms:al2023-minimal` base image.
 - Repository documentation and local artifact names now identify the project as
