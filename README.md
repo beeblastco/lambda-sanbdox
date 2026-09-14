@@ -86,6 +86,26 @@ The Dockerfile is a multi-stage build:
 
 - **Builder stage:** `rust:1.96.0-bookworm` compiles the `sandbox-server` binary
 - **Runtime stage:** `public.ecr.aws/lambda/microvms:al2023-minimal` (the MicroVM managed base) with bash, git, jq, python3, Node.js 22, `uv`, ripgrep, and `mount-s3`
+- **Browser stage** (opt-in, `--target browser`): the runtime stage plus headless Chromium
+
+The default target is the runtime stage, so CI and the MicroVM image build are unaffected by the browser stage.
+
+### Browser image
+
+```bash
+docker build --platform linux/arm64 --target browser -t lambda-microvm-agent-sandbox:browser .
+```
+
+MicroVMs are arm64-only and `google-chrome-stable` publishes no linux-arm64 build, so this stage installs Playwright's Chrome Headless Shell and links it as `chromium`. It adds roughly 770 MB to the image.
+
+Exec runs as root with `HOME` and `TMPDIR` on the workspace mount (S3-backed in production), so keep the profile on local disk:
+
+```bash
+chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
+  --user-data-dir="$(mktemp -d -p /tmp)" --screenshot=/tmp/shot.png https://example.com
+```
+
+`mktemp -d` without `-p /tmp` puts the profile in the workspace, which is slow on a FUSE mount. For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
 
 ---
 
