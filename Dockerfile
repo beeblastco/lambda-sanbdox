@@ -15,7 +15,7 @@ RUN cargo build --release --locked --bin sandbox-server
 # The AWS Lambda MicroVM managed base image. Lambda boots a Firecracker MicroVM
 # from this OS, then runs this container's CMD as a long-lived server. This is
 # not a Lambda custom runtime, RIE, or Runtime API image.
-FROM public.ecr.aws/lambda/microvms:al2023-minimal
+FROM public.ecr.aws/lambda/microvms:al2023-minimal AS runtime
 
 # Toolchain the agent's bash/python/node code expects, plus fuse + util-linux so the
 # /run hook can mount the workspace with mountpoint-s3.
@@ -72,3 +72,55 @@ RUN chmod +x /usr/local/bin/sandbox-server \
 EXPOSE 8080 9000
 
 CMD ["/usr/local/bin/sandbox-server"]
+
+
+# ─── Browser stage (docker build --target browser) ───
+#
+# Headless Chromium for screenshots, DOM dumps and CDP automation. MicroVMs are
+# arm64-only and google-chrome-stable ships no linux-arm64 build, so this installs
+# Playwright's Chrome Headless Shell and exposes it as `chromium`.
+#
+# Exec runs as root with HOME and TMPDIR on the workspace mount, so keep the profile
+# on local disk:
+#   chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
+#     --user-data-dir="$(mktemp -d -p /tmp)" --screenshot=/tmp/shot.png https://example.com
+# From Node, point playwright-core at it: chromium.launch({ executablePath: "/usr/local/bin/chromium" }).
+FROM runtime AS browser
+
+# The libraries `ldd chrome-headless-shell` reports missing on al2023-minimal, plus
+# fontconfig and DejaVu Sans so pages render text (it covers Vietnamese diacritics).
+ARG PLAYWRIGHT_VERSION=1.63.0
+RUN dnf install -y \
+    alsa-lib \
+    at-spi2-core \
+    atk \
+    dbus-libs \
+    dejavu-sans-fonts \
+    expat \
+    fontconfig \
+    libX11 \
+    libXcomposite \
+    libXdamage \
+    libXext \
+    libXfixes \
+    libXrandr \
+    libxcb \
+    libxkbcommon \
+    mesa-libgbm \
+    nspr \
+    nss \
+    nss-util \
+    systemd-libs \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+       npx -y "playwright@${PLAYWRIGHT_VERSION}" install chromium-headless-shell \
+    && ln -s /opt/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/chrome-headless-shell \
+       /usr/local/bin/chromium \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /root/.npm /root/.cache
+
+
+# ─── Default target ───
+#
+# Last on purpose: CI and the MicroVM image build use the default target, so a plain
+# build keeps producing the base image.
+FROM runtime

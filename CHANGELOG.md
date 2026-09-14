@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional `browser` build target: the runtime image plus Playwright's Chrome
+  Headless Shell (arm64) on PATH as `chromium`, for screenshots, DOM dumps and
+  CDP automation. `docker build --target browser` builds it; the default target
+  still builds the base image.
+
 ### Fixed
 
 - Parallel executions against one workspace now use unique hidden runtime script

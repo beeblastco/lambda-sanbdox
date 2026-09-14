@@ -122,6 +122,30 @@ jobs:
             -d '{"runtime":"bash","code":"echo hello; node -v; python3 --version","timeout_ms":30000}' | grep '"ok":true'
           docker rm -f sandbox-smoke
 
+      # The browser stage is opt-in (`--target browser`), so nothing else builds it.
+      - name: Build arm64 browser image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: browser
+          push: false
+          load: true
+          tags: lambda-microvm-agent-sandbox:browser
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ env.DOCKER_PLATFORM }}
+          provenance: false
+          sbom: false
+
+      - name: Smoke test browser image
+        run: |
+          docker run -d --name sandbox-browser-smoke -p 8081:8080 lambda-microvm-agent-sandbox:browser
+          sleep 4
+          curl -fsS -X POST "http://localhost:8081/exec" \
+            -H 'content-type: application/json' \
+            -d '{"runtime":"bash","code":"chromium --version","timeout_ms":60000}' | grep '"ok":true'
+          docker rm -f sandbox-browser-smoke
+
   # ─── Arm64 build & push to every ECR_REGIONS region + GHCR (main only) ───
   build-platform:
     runs-on: ubuntu-latest

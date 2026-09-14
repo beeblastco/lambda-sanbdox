@@ -36,6 +36,12 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # One image per variant. AWS builds the Dockerfile's last stage, so the browser
+    # variant appends `FROM browser` before zipping and publishes under its own name.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, browser]
     steps:
       - uses: actions/checkout@v5
 
@@ -70,9 +76,14 @@ jobs:
           ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
           IMAGE_NAME: ${{ vars.MICROVM_IMAGE_NAME || 'lambda-microvm-agent-sandbox' }}
           BASE_OVERRIDE: ${{ vars.MICROVM_BASE_IMAGE_ARN }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
           SHA="${GITHUB_SHA::7}"
+          if [ "$VARIANT" != "base" ]; then
+            IMAGE_NAME="${IMAGE_NAME}-${VARIANT}"
+            printf '\nFROM %s\n' "$VARIANT" >> Dockerfile
+          fi
 
           # The code artifact: Dockerfile at the zip root + everything it COPYs.
           zip -r artifact.zip Dockerfile Cargo.toml Cargo.lock src >/dev/null
