@@ -8,17 +8,12 @@
 //!     S3 prefix; `/suspend`/`/terminate` flush it). Configured via `--hooks` at
 //!     image-create time; both ports must be `EXPOSE`d in the Dockerfile.
 
+use std::path::Path;
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    routing::get,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
 use lambda_microvm_agent_sandbox::{
-    mount::{self, ContainerCredentials, MountCredentials, Workspace, CREDENTIALS_PATH},
+    mount::{self, MountCredentials, Workspace, CREDENTIALS_DIR, CREDENTIALS_PATH},
     run_exec, ExecRequest, ExecResponse,
 };
 use tokio::net::TcpListener;
@@ -38,11 +33,6 @@ struct AppState {
     // The workspace `/run` mounted, replayed by `/resume`: mountpoint-s3 does not
     // survive the suspend snapshot, so a restored VM has to mount again.
     workspace: Arc<Mutex<Option<Workspace>>>,
-    // Latest credentials for the mount, served to mountpoint-s3 and refreshed by the
-    // harness before the previous session expires.
-    credentials: Arc<Mutex<Option<MountCredentials>>>,
-    // Bearer the credential endpoint requires, minted per boot.
-    credentials_token: Arc<String>,
 }
 
 #[tokio::main]
@@ -51,18 +41,13 @@ async fn main() -> anyhow::Result<()> {
         exec_lock: Arc::new(Mutex::new(())),
         mount_point: Arc::new(Mutex::new(None)),
         workspace: Arc::new(Mutex::new(None)),
-        credentials: Arc::new(Mutex::new(None)),
-        credentials_token: Arc::new(mint_token()),
     };
 
     let exec_app = Router::new()
         .route("/", get(health))
         .route("/healthz", get(health))
         .route("/exec", post(exec_handler))
-        .route(
-            CREDENTIALS_PATH,
-            get(credentials_handler).post(put_credentials_handler),
-        )
+        .route(CREDENTIALS_PATH, post(put_credentials_handler))
         .with_state(state.clone());
 
     let hooks_app = Router::new()
@@ -137,7 +122,6 @@ async fn run_hook(State(state): State<AppState>, body: String) -> (StatusCode, S
         Ok(None) => return (StatusCode::OK, String::new()),
         Err(e) => return hook_failed("/run", e),
     };
-    *state.credentials.lock().await = workspace.mount.env.clone();
     *state.workspace.lock().await = Some(workspace.clone());
     match remount(&state, &workspace).await {
         Ok(point) => {
@@ -157,36 +141,19 @@ fn hook_failed(hook: &str, error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
-/// `GET /workspace/credentials` — the container-credential-provider endpoint
-/// mountpoint-s3 re-fetches from as its session nears expiry.
-async fn credentials_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<ContainerCredentials>, StatusCode> {
-    if !authorized(&headers, &state.credentials_token) {
-        return Err(StatusCode::FORBIDDEN);
+/// `POST /workspace/credentials` — the harness replaces the mount's session before
+/// the current one expires. No remount: mountpoint-s3's `credential_process` reads
+/// the rewritten file on its next refresh.
+async fn put_credentials_handler(Json(creds): Json<MountCredentials>) -> (StatusCode, String) {
+    match mount::write_credentials(Path::new(CREDENTIALS_DIR), &creds).await {
+        Ok(()) => (StatusCode::OK, String::new()),
+        Err(e) => hook_failed(CREDENTIALS_PATH, e),
     }
-    match state.credentials.lock().await.as_ref() {
-        Some(creds) => Ok(Json(ContainerCredentials::from(creds))),
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-/// `POST /workspace/credentials` — the harness replaces the mount's credentials
-/// before the current session expires. No remount: mountpoint-s3 picks these up on
-/// its next refresh.
-async fn put_credentials_handler(
-    State(state): State<AppState>,
-    Json(creds): Json<MountCredentials>,
-) -> StatusCode {
-    *state.credentials.lock().await = Some(creds);
-
-    StatusCode::OK
 }
 
 /// Mount the workspace and record the mount point for `/terminate` to flush.
 async fn remount(state: &AppState, workspace: &Workspace) -> anyhow::Result<String> {
-    let point = mount::mount_workspace(workspace).await?;
+    let point = mount::mount_workspace(workspace, Path::new(CREDENTIALS_DIR)).await?;
     *state.mount_point.lock().await = Some(point.clone());
 
     Ok(point)
@@ -206,21 +173,6 @@ async fn terminate_hook(State(state): State<AppState>) -> StatusCode {
     }
     flush();
     StatusCode::OK
-}
-
-/// Per-boot bearer for the credential endpoint. The agent's own code shares this VM
-/// and could read it either way — the token only keeps the endpoint from answering
-/// anything that reaches the port by accident.
-fn mint_token() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
-}
-
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim_start_matches("Bearer ").trim() == token)
-        .unwrap_or(false)
 }
 
 fn flush() {

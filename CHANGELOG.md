@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A persistent workspace mount no longer dies with `Input/output error` an hour
+  after boot. mount-s3 was started with the session's static keys, so the
+  refreshed session the harness posts to `/workspace/credentials` never reached
+  it. It now reads credentials through a `credential_process` that prints a
+  local file, which `/run` writes and each refresh rewrites. The unused
+  `GET /workspace/credentials` endpoint is gone.
 - Parallel executions against one workspace now use unique hidden runtime script
   names, preventing one MicroVM from removing another call's program.
 - CI no longer attempts to build an unsupported `linux/amd64` image from the
