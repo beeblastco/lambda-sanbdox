@@ -8,21 +8,34 @@
 //! credentials never reach the VM — only the prefix-scoped session credentials do,
 //! and any code the agent runs can read them, so nothing wider may be passed.
 //!
-//! Those sessions expire in an hour, which a persistent VM outlives. The mount takes
-//! the static keys (the credential endpoint is not reachable during the boot-time
-//! `/run`), and the harness remounts with a fresh session before they expire.
+//! Those sessions expire in an hour, which a persistent VM outlives. So mountpoint-s3
+//! never gets the keys directly: it reads them through a `credential_process` that
+//! prints a local file, which `/run` writes at boot and the harness rewrites through
+//! `POST /workspace/credentials`. The process is local, so it works during the
+//! boot-time `/run` when no network endpoint is reachable, and the AWS CRT's
+//! credential cache re-runs it as the session nears expiry. A mount given static
+//! env keys instead keeps them for its whole life and fails with EIO an hour in.
 //!
 //! The mount prefix already encodes the namespace (`<prefix>/<namespace>/`), and the
 //! local mount point also ends in the namespace, so the two stay aligned with the
 //! exec engine's independent `{root}/{namespace}` join — no double-prefixing.
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// Path the local credential endpoint is served on. The harness keeps it stocked so
-/// a remount always has a live session to use.
+/// Path the harness posts refreshed mount credentials to.
 pub const CREDENTIALS_PATH: &str = "/workspace/credentials";
+
+/// Where the mount's credentials and the AWS config naming them live. Outside every
+/// workspace, so they never sync to S3.
+pub const CREDENTIALS_DIR: &str = "/run/sandbox-mount";
+
+const AWS_CONFIG_FILE: &str = "aws-config";
+const CREDENTIALS_FILE: &str = "credentials.json";
 
 /// Body of `POST /aws/lambda-microvms/runtime/v1/run`. Lambda does not spread what
 /// we handed `RunMicrovm` at the top level — it nests it under `runHookPayload`, as a
@@ -65,33 +78,22 @@ pub struct MountCredentials {
     pub secret_access_key: String,
     #[serde(rename = "AWS_SESSION_TOKEN")]
     pub session_token: String,
-    /// RFC3339 expiry. Drives mountpoint-s3's refresh clock; without it the SDK
-    /// treats the session as non-expiring and never re-fetches.
+    /// RFC3339 expiry. Drives the credential cache's refresh clock; without it the
+    /// session reads as non-expiring and is never re-fetched.
     #[serde(rename = "AWS_CREDENTIAL_EXPIRATION", default)]
     pub expiration: Option<String>,
 }
 
-/// The container-credential-provider shape mountpoint-s3 expects from
-/// `AWS_CONTAINER_CREDENTIALS_FULL_URI`.
+/// What a `credential_process` prints, in the AWS CLI's documented shape.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct ContainerCredentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub token: String,
+struct ProcessCredentials<'a> {
+    version: u8,
+    access_key_id: &'a str,
+    secret_access_key: &'a str,
+    session_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expiration: Option<String>,
-}
-
-impl From<&MountCredentials> for ContainerCredentials {
-    fn from(creds: &MountCredentials) -> Self {
-        Self {
-            access_key_id: creds.access_key_id.clone(),
-            secret_access_key: creds.secret_access_key.clone(),
-            token: creds.session_token.clone(),
-            expiration: creds.expiration.clone(),
-        }
-    }
+    expiration: Option<String>,
 }
 
 /// Local mount point for a workspace: `{root}/{namespace}` with `root`'s trailing
@@ -124,11 +126,15 @@ pub fn parse_payload(body: &str) -> anyhow::Result<Option<Workspace>> {
 
 /// Mount `ws.mount.bucket` at `{root}/{namespace}` via mountpoint-s3. Idempotent:
 /// `/run` may be retried, and a path already mounted is left as-is.
-pub async fn mount_workspace(ws: &Workspace) -> anyhow::Result<String> {
+pub async fn mount_workspace(ws: &Workspace, credentials_dir: &Path) -> anyhow::Result<String> {
     let point = mount_point(&ws.root, &ws.namespace);
     tokio::fs::create_dir_all(&point)
         .await
         .with_context(|| format!("create mount dir {point}"))?;
+    // Before the mounted check: a retried `/run` still leaves the freshest session.
+    if let Some(creds) = &ws.mount.env {
+        write_credentials(credentials_dir, creds).await?;
+    }
 
     if is_mounted(&point).await {
         return Ok(point);
@@ -149,18 +155,8 @@ pub async fn mount_workspace(ws: &Workspace) -> anyhow::Result<String> {
     }
 
     // Clear inherited env so only the scoped mount credentials reach mountpoint-s3.
-    // These are the session's static keys: the credential endpoint is not reachable
-    // during the boot-time `/run`, and a mount that cannot resolve credentials fails
-    // the whole VM. The session expires in an hour, so the harness remounts before
-    // then (see remount on `/resume` and the harness-side refresh).
     cmd.env_clear()
-        .env("HOME", "/root")
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
-    if let Some(creds) = &ws.mount.env {
-        cmd.env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
-            .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key)
-            .env("AWS_SESSION_TOKEN", &creds.session_token);
-    }
+        .envs(mount_env(ws.mount.env.as_ref().map(|_| credentials_dir)));
 
     let output = cmd.output().await.context("spawn mount-s3")?;
     if !output.status.success() {
@@ -180,6 +176,49 @@ pub async fn mount_workspace(ws: &Workspace) -> anyhow::Result<String> {
     Ok(point)
 }
 
+/// Environment for mount-s3. With scoped credentials, only `AWS_CONFIG_FILE`: static
+/// keys in the environment would win the provider chain and never refresh. Without
+/// them, the default chain resolves the MicroVM execution role.
+pub fn mount_env(credentials_dir: Option<&Path>) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("HOME", "/root".to_string()),
+        ("PATH", "/usr/local/bin:/usr/bin:/bin".to_string()),
+    ];
+    if let Some(dir) = credentials_dir {
+        env.push((
+            "AWS_CONFIG_FILE",
+            dir.join(AWS_CONFIG_FILE).display().to_string(),
+        ));
+    }
+
+    env
+}
+
+/// Stock the files mountpoint-s3's `credential_process` reads. Each file is replaced
+/// by rename, so a refresh racing a read sees the old session or the new one, never
+/// half of either.
+pub async fn write_credentials(dir: &Path, creds: &MountCredentials) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("create credentials dir {}", dir.display()))?;
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    let credentials = ProcessCredentials {
+        version: 1,
+        access_key_id: &creds.access_key_id,
+        secret_access_key: &creds.secret_access_key,
+        session_token: &creds.session_token,
+        expiration: creds.expiration.as_deref().map(whole_seconds),
+    };
+    let credentials_file = dir.join(CREDENTIALS_FILE);
+    write_private(&credentials_file, &serde_json::to_vec(&credentials)?).await?;
+    let config = format!(
+        "[default]\ncredential_process = /bin/cat {}\n",
+        credentials_file.display()
+    );
+
+    write_private(&dir.join(AWS_CONFIG_FILE), config.as_bytes()).await
+}
+
 /// Best-effort unmount, used by `/terminate` to flush mountpoint-s3's in-flight
 /// uploads before the VM is destroyed. Never fails the caller.
 pub async fn unmount(point: &str) {
@@ -197,9 +236,106 @@ async fn is_mounted(point: &str) -> bool {
         .unwrap_or(false)
 }
 
+// JavaScript's `toISOString` adds milliseconds. Keep the plain RFC3339 form the
+// AWS CLI's `credential_process` examples use, so no parser has to handle them.
+fn whole_seconds(expiration: &str) -> String {
+    match (expiration.find('.'), expiration.rfind('Z')) {
+        (Some(dot), Some(zone)) if dot < zone => {
+            format!("{}{}", &expiration[..dot], &expiration[zone..])
+        }
+        _ => expiration.to_string(),
+    }
+}
+
+async fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let staged = PathBuf::from(format!("{}.tmp", path.display()));
+    tokio::fs::write(&staged, contents)
+        .await
+        .with_context(|| format!("write {}", staged.display()))?;
+    tokio::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).await?;
+    tokio::fs::rename(&staged, path)
+        .await
+        .with_context(|| format!("replace {}", path.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(access_key_id: &str) -> MountCredentials {
+        MountCredentials {
+            access_key_id: access_key_id.to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: "token".to_string(),
+            expiration: Some("2026-09-17T14:00:00.000Z".to_string()),
+        }
+    }
+
+    // What mountpoint-s3 gets when it asks for credentials: the configured
+    // `credential_process`, run the way the CRT runs it.
+    async fn run_credential_process(dir: &Path) -> serde_json::Value {
+        let config = tokio::fs::read_to_string(dir.join(AWS_CONFIG_FILE))
+            .await
+            .expect("config");
+        let command = config
+            .lines()
+            .find_map(|line| line.strip_prefix("credential_process = "))
+            .expect("credential_process line");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .await
+            .expect("run credential_process");
+
+        serde_json::from_slice(&output.stdout).expect("process output json")
+    }
+
+    // The mount outlives its one-hour session, so it must not pin static keys: they
+    // would win the provider chain and the refreshed session would never be read.
+    #[test]
+    fn mount_env_reads_scoped_credentials_through_the_config_file() {
+        let env = mount_env(Some(Path::new("/run/sandbox-mount")));
+
+        assert!(env.iter().all(|(name, _)| !name.starts_with("AWS_ACCESS")
+            && !name.starts_with("AWS_SECRET")
+            && *name != "AWS_SESSION_TOKEN"));
+        assert!(env.contains(&(
+            "AWS_CONFIG_FILE",
+            "/run/sandbox-mount/aws-config".to_string()
+        )));
+        assert!(mount_env(None)
+            .iter()
+            .all(|(name, _)| !name.starts_with("AWS_")));
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_session_reaches_the_credential_process() {
+        let dir = std::env::temp_dir().join(format!("sandbox-mount-{}", uuid::Uuid::new_v4()));
+
+        write_credentials(&dir, &session("AKIA_BOOT"))
+            .await
+            .expect("write boot");
+        let boot = run_credential_process(&dir).await;
+        write_credentials(&dir, &session("AKIA_REFRESHED"))
+            .await
+            .expect("write refresh");
+        let refreshed = run_credential_process(&dir).await;
+
+        assert_eq!(boot["Version"], 1);
+        assert_eq!(boot["AccessKeyId"], "AKIA_BOOT");
+        assert_eq!(boot["SessionToken"], "token");
+        assert_eq!(boot["Expiration"], "2026-09-17T14:00:00Z");
+        assert_eq!(refreshed["AccessKeyId"], "AKIA_REFRESHED");
+        let mode = std::fs::metadata(dir.join(CREDENTIALS_FILE))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn mount_point_trims_trailing_slashes() {
