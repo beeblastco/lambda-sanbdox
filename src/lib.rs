@@ -17,9 +17,13 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Instant;
 use tokio::fs;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
@@ -29,7 +33,14 @@ const MAX_CODE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 const MAX_TOTAL_ENV_BYTES: usize = 256 * 1024; // 256 KB
 const MAX_ARGS_COUNT: usize = 64;
 const MAX_ARGS_TOTAL_BYTES: usize = 64 * 1024; // 64 KB
-const MAX_TIMEOUT_MS: u64 = 300_000; // 5 minutes cap
+const MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes, the broods lambda provider's ceiling
+
+// How long to keep reading output after the child exits. Anything it backgrounded
+// inherits the pipes and can hold them open for as long as it runs.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+/// Largest `/exec` body the server buffers: the code cap plus room for JSON escaping.
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024; // 16 MB
 const DEFAULT_WORKSPACE_ROOT: &str = "/mnt/workspaces";
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +82,10 @@ pub struct ExecResponse {
     pub stderr: String,
     pub workspace: String,
 
+    /// True when stdout or stderr passed its 256 KB cap and was cut. The cut text
+    /// ends in `...[truncated]`, so callers decoding it must check this first.
+    pub truncated: bool,
+
     /// CPU time (user + system, including descendants) charged to the sandboxed
     /// process, in microseconds. Measured as a delta around the run off the
     /// cgroup v2 `cpu.stat` `usage_usec` counter (microsecond resolution), with a
@@ -96,15 +111,21 @@ fn validate_namespace(ns: &str) -> bool {
     hex.len() == 40 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
 }
 
-fn runtime_script_name(runtime: &str) -> anyhow::Result<String> {
-    let extension = match runtime {
-        "bash" | "sh" => "sh",
-        "python" | "python3" | "py" => "py",
-        "node" | "nodejs" | "js" | "javascript" => "js",
+/// The interpreter for `runtime` and a unique script name to run it on. Bash
+/// scripts go through the interpreter too: mountpoint-s3 rejects chmod, so a script
+/// on the workspace mount can't be made executable.
+fn runtime_program(runtime: &str) -> anyhow::Result<(&'static str, String)> {
+    let (interpreter, extension) = match runtime {
+        "bash" | "sh" => ("/bin/bash", "sh"),
+        "python" | "python3" | "py" => ("/usr/bin/python3", "py"),
+        "node" | "nodejs" | "js" | "javascript" => ("/usr/bin/node", "js"),
         other => return Err(anyhow!("unsupported runtime: {other}")),
     };
 
-    Ok(format!(".broods-exec-{}.{}", Uuid::new_v4(), extension))
+    Ok((
+        interpreter,
+        format!(".broods-exec-{}.{}", Uuid::new_v4(), extension),
+    ))
 }
 
 fn resolve_workspace(req: &ExecRequest) -> Result<(PathBuf, bool), anyhow::Error> {
@@ -144,6 +165,7 @@ fn error_response(
         stdout: String::new(),
         stderr,
         workspace,
+        truncated: false,
         cpu_usec: None,
     }
 }
@@ -231,7 +253,7 @@ async fn execute_request(
 
     let runtime = req.runtime.to_lowercase();
 
-    let script_name = runtime_script_name(&runtime)?;
+    let (interpreter, script_name) = runtime_program(&runtime)?;
 
     // A unique script in the workspace root preserves python/node relative imports
     // without letting parallel MicroVMs overwrite or remove each other's program.
@@ -241,44 +263,12 @@ async fn execute_request(
         .context("failed to write code file")?;
 
     let path_str = script_path.display().to_string();
-
-    let bash_command = match runtime.as_str() {
-        "bash" | "sh" => {
-            // Invoked through the interpreter, like python/node below, rather than
-            // chmod +x'd and run directly: the workspace is a mountpoint-s3 FUSE
-            // mount, which rejects chmod outright, and that failure took down every
-            // bash call the moment the mount started working.
-            let q = shlex::try_quote(&path_str).map_err(|e| anyhow!("invalid path: {e}"))?;
-            let mut cmd = format!("/bin/bash {q}");
-            for arg in &req.args {
-                let aq = shlex::try_quote(arg).map_err(|e| anyhow!("invalid arg: {e}"))?;
-                cmd.push(' ');
-                cmd.push_str(&aq);
-            }
-            cmd
-        }
-        "python" | "python3" | "py" => {
-            let q = shlex::try_quote(&path_str).map_err(|e| anyhow!("invalid path: {e}"))?;
-            let mut cmd = format!("/usr/bin/python3 {q}");
-            for arg in &req.args {
-                let aq = shlex::try_quote(arg).map_err(|e| anyhow!("invalid arg: {e}"))?;
-                cmd.push(' ');
-                cmd.push_str(&aq);
-            }
-            cmd
-        }
-        "node" | "nodejs" | "js" | "javascript" => {
-            let q = shlex::try_quote(&path_str).map_err(|e| anyhow!("invalid path: {e}"))?;
-            let mut cmd = format!("/usr/bin/node {q}");
-            for arg in &req.args {
-                let aq = shlex::try_quote(arg).map_err(|e| anyhow!("invalid arg: {e}"))?;
-                cmd.push(' ');
-                cmd.push_str(&aq);
-            }
-            cmd
-        }
-        _ => unreachable!(),
-    };
+    let mut bash_command = interpreter.to_string();
+    for word in std::iter::once(&path_str).chain(&req.args) {
+        let quoted = shlex::try_quote(word).map_err(|e| anyhow!("invalid argument: {e}"))?;
+        bash_command.push(' ');
+        bash_command.push_str(&quoted);
+    }
 
     let mut command = Command::new("bash");
     command
@@ -289,6 +279,11 @@ async fn execute_request(
         .env("HOME", workspace)
         .env("TMPDIR", workspace)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group, so a timeout can kill everything the script started.
+        .process_group(0)
         .kill_on_drop(true);
 
     for (key, value) in &req.env {
@@ -296,10 +291,22 @@ async fn execute_request(
     }
 
     let cpu_before = children_cpu_usec();
-    let timeout_result = timeout(Duration::from_millis(req.timeout_ms), command.output()).await;
-    // Read immediately after the child is reaped (output() awaits the wait), before
-    // the parent-side script removal / sync below touch anything.
+    let mut child = command.spawn().context("failed to run child process")?;
+    let stdout = CappedReader::spawn(child.stdout.take(), MAX_STDOUT_SIZE);
+    let stderr = CappedReader::spawn(child.stderr.take(), MAX_STDERR_SIZE);
+    let waited = timeout(Duration::from_millis(req.timeout_ms), child.wait()).await;
+    // Read right after the child is reaped, before the script removal and sync below.
     let cpu_usec = children_cpu_usec().saturating_sub(cpu_before);
+    let status = match waited {
+        Ok(status) => Some(status.context("failed to wait for child process")?),
+        Err(_) => {
+            kill_process_group(&mut child).await;
+            None
+        }
+    };
+    let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
+    let (stdout, stdout_cut) = capped_text(&stdout, MAX_STDOUT_SIZE);
+    let (mut stderr, stderr_cut) = capped_text(&stderr, MAX_STDERR_SIZE);
 
     // Remove this run's unique script so it never lingers in a persistent workspace.
     // Best-effort: the sync below flushes the unlink too.
@@ -319,71 +326,220 @@ async fn execute_request(
     // in filthy-panty #64; remove this flush once that layer lands.
     if req.namespace.is_some() {
         // SAFETY: sync() takes no arguments and has no failure mode; it flushes
-        // all filesystem buffers (including the NFS-backed workspace mount).
+        // all filesystem buffers.
         unsafe {
             libc::sync();
         }
     }
 
-    match timeout_result {
-        Ok(output_result) => {
-            let output = output_result.context("failed to run child process")?;
-            let stdout = truncate_string(&String::from_utf8_lossy(&output.stdout), MAX_STDOUT_SIZE);
-            let stderr = truncate_string(&String::from_utf8_lossy(&output.stderr), MAX_STDERR_SIZE);
-            Ok(ExecResponse {
-                ok: output.status.success(),
-                runtime: req.runtime.clone(),
-                exit_code: output.status.code(),
-                timed_out: false,
-                duration_ms: started.elapsed().as_millis(),
-                stdout,
-                stderr,
-                workspace: workspace.display().to_string(),
-                cpu_usec: Some(cpu_usec),
-            })
+    let Some(status) = status else {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
         }
-        // On timeout the child is SIGKILLed via kill_on_drop and reaped
-        // asynchronously, so RUSAGE_CHILDREN may not yet reflect it — omit the
-        // sample rather than report a misleading partial number.
-        Err(_) => Ok(ExecResponse {
+        stderr.push_str(&format!("execution timed out after {} ms", req.timeout_ms));
+        // The killed child is reaped asynchronously, so RUSAGE_CHILDREN may not yet
+        // reflect it. Omit the sample rather than report a misleading partial number.
+        return Ok(ExecResponse {
             ok: false,
             runtime: req.runtime.clone(),
             exit_code: None,
             timed_out: true,
             duration_ms: started.elapsed().as_millis(),
-            stdout: "".to_string(),
-            stderr: format!("execution timed out after {} ms", req.timeout_ms),
+            stdout,
+            stderr,
             workspace: workspace.display().to_string(),
+            truncated: stdout_cut || stderr_cut,
             cpu_usec: None,
-        }),
+        });
+    };
+
+    Ok(ExecResponse {
+        ok: status.success(),
+        runtime: req.runtime.clone(),
+        exit_code: status.code(),
+        timed_out: false,
+        duration_ms: started.elapsed().as_millis(),
+        stdout,
+        stderr,
+        workspace: workspace.display().to_string(),
+        truncated: stdout_cut || stderr_cut,
+        cpu_usec: Some(cpu_usec),
+    })
+}
+
+/// A child's stdout or stderr, read to EOF on its own task so the child never
+/// blocks on a full pipe. Keeps `cap + 1` bytes, one past the cap so the caller can
+/// tell a cut stream from one that fits exactly, and discards the rest.
+struct CappedReader {
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<Vec<u8>>,
+}
+
+impl CappedReader {
+    fn spawn(pipe: Option<impl AsyncRead + Unpin + Send + 'static>, cap: usize) -> Self {
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            match pipe {
+                Some(pipe) => read_capped(pipe, cap + 1, stopped).await,
+                None => Vec::new(),
+            }
+        });
+
+        Self { stop, task }
     }
+
+    /// The bytes read once the pipe closes, or after `OUTPUT_DRAIN_GRACE` if a
+    /// process the child backgrounded still holds it open.
+    async fn finish(mut self) -> Vec<u8> {
+        if let Ok(Ok(bytes)) = timeout(OUTPUT_DRAIN_GRACE, &mut self.task).await {
+            return bytes;
+        }
+        let _ = self.stop.send(());
+
+        self.task.await.unwrap_or_default()
+    }
+}
+
+/// Decode captured output and cut it at `cap` bytes. Returns the text and whether
+/// it was cut.
+fn capped_text(bytes: &[u8], cap: usize) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+
+    (truncate_string(&text, cap), text.len() > cap)
+}
+
+/// SIGKILL the child's process group, then reap the child. A process that called
+/// `setsid` has left the group and survives, as broods's detached jobs intend.
+async fn kill_process_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: killpg only sends a signal. The child was spawned with
+        // process_group(0), so its pid is the group id.
+        unsafe {
+            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+    let _ = child.wait().await;
+}
+
+async fn read_capped(
+    mut pipe: impl AsyncRead + Unpin,
+    keep: usize,
+    mut stop: oneshot::Receiver<()>,
+) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = tokio::select! {
+            read = pipe.read(&mut chunk) => read,
+            _ = &mut stop => break,
+        };
+        match read {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let room = keep.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+
+    kept
 }
 
 #[cfg(test)]
 mod runtime_script_tests {
-    use super::runtime_script_name;
+    use super::runtime_program;
 
     #[test]
     fn creates_unique_hidden_script_names() {
-        let first = runtime_script_name("bash").expect("bash script name");
-        let second = runtime_script_name("bash").expect("bash script name");
+        let (bash, first) = runtime_program("bash").expect("bash program");
+        let (_, second) = runtime_program("bash").expect("bash program");
 
+        assert_eq!(bash, "/bin/bash");
         assert_ne!(first, second);
         assert!(first.starts_with(".broods-exec-"));
         assert!(first.ends_with(".sh"));
-        assert!(runtime_script_name("python3")
-            .expect("python script name")
-            .ends_with(".py"));
-        assert!(runtime_script_name("node")
-            .expect("node script name")
-            .ends_with(".js"));
+        let (python, script) = runtime_program("python3").expect("python program");
+        assert_eq!(python, "/usr/bin/python3");
+        assert!(script.ends_with(".py"));
+        let (node, script) = runtime_program("node").expect("node program");
+        assert_eq!(node, "/usr/bin/node");
+        assert!(script.ends_with(".js"));
     }
 
     #[test]
     fn rejects_unsupported_runtimes() {
-        let error = runtime_script_name("ruby").expect_err("unsupported runtime");
+        let error = runtime_program("ruby").expect_err("unsupported runtime");
 
         assert_eq!(error.to_string(), "unsupported runtime: ruby");
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::{run_exec, ExecRequest, MAX_STDOUT_SIZE};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn bash(code: &str, timeout_ms: u64) -> ExecRequest {
+        ExecRequest {
+            runtime: "bash".to_string(),
+            code: code.to_string(),
+            namespace: None,
+            workspace_root: None,
+            timeout_ms,
+            args: Vec::new(),
+            env: HashMap::new(),
+        }
+    }
+
+    // A backgrounded process inherits the pipes. The run used to wait on them until
+    // its timeout and lose the output of a script that had long exited.
+    #[tokio::test]
+    async fn a_backgrounded_process_does_not_hold_the_run_open() {
+        let response = run_exec(bash("sleep 3 & echo done", 10_000)).await;
+
+        assert!(response.ok, "{}", response.stderr);
+        assert!(!response.timed_out);
+        assert_eq!(response.stdout, "done\n");
+        assert!(
+            response.duration_ms < 2_000,
+            "took {}ms",
+            response.duration_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_the_process_group_and_keeps_partial_output() {
+        let response = run_exec(bash("sleep 30 & echo $!; sleep 30", 500)).await;
+        let orphan: libc::pid_t = response.stdout.trim().parse().expect("orphan pid");
+
+        assert!(response.timed_out);
+        assert!(response
+            .stderr
+            .ends_with("execution timed out after 500 ms"));
+        // The orphan's new parent reaps it asynchronously, so give it a moment.
+        let mut alive = true;
+        for _ in 0..20 {
+            // SAFETY: signal 0 only checks that the pid exists.
+            alive = unsafe { libc::kill(orphan, 0) } == 0;
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!alive, "backgrounded sleep {orphan} survived the timeout");
+    }
+
+    #[tokio::test]
+    async fn flags_output_cut_at_the_cap() {
+        let cut = run_exec(bash("head -c 300000 /dev/zero | tr '\\0' a", 10_000)).await;
+        let fits = run_exec(bash("head -c 1000 /dev/zero | tr '\\0' a", 10_000)).await;
+
+        assert!(cut.truncated);
+        assert!(cut.stdout.starts_with(&"a".repeat(MAX_STDOUT_SIZE)));
+        assert!(cut.stdout.ends_with("...[truncated]"));
+        assert!(!fits.truncated);
+        assert_eq!(fits.stdout.len(), 1000);
     }
 }
 
