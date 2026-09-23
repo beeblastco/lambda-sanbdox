@@ -24,8 +24,8 @@ A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which l
 **Key features:**
 
 - Isolated per-run workspace under `/tmp/agent-workspace/<uuid>/` (ephemeral) or `/mnt/workspaces/<namespace>/` (persistent, S3-backed)
-- Configurable execution timeout (default 30s, 300s cap)
-- stdout/stderr capture with truncation at 256 KB each
+- Configurable execution timeout (default 30s, 600s cap)
+- stdout/stderr capture with truncation at 256 KB each, flagged by `truncated`
 - Custom environment variables and command-line arguments
 - Automatic ephemeral-workspace cleanup after each run
 - `env_clear()` prevents AWS credential leakage into sandbox code
@@ -145,6 +145,7 @@ curl -s -X POST "http://localhost:8080/exec" \
   "stdout": "hello from bash\nv22.x.x\nPython 3.x.x\nHTTP/2 200",
   "stderr": "",
   "workspace": "/tmp/agent-workspace/<uuid>",
+  "truncated": false,
   "cpu_usec": 84210
 }
 ```
@@ -229,9 +230,10 @@ via `MICROVM_IMAGE_IDENTIFIER`.
 | `exit_code` | integer \| null | Process exit code, or `null` if timed out |
 | `timed_out` | boolean | `true` if execution exceeded `timeout_ms` |
 | `duration_ms` | integer | Wall-clock execution time in milliseconds |
-| `stdout` | string | Captured stdout (truncated to 256 KB) |
+| `stdout` | string | Captured stdout (truncated to 256 KB). Partial output on a timeout. |
 | `stderr` | string | Captured stderr (truncated to 256 KB) |
 | `workspace` | string | Path to the workspace directory used for this run |
+| `truncated` | boolean | `true` if stdout or stderr passed 256 KB and was cut. Cut text ends in `...[truncated]`, so check this before decoding output. |
 | `cpu_usec` | integer | CPU time (user + system, incl. descendants) charged to the run, in microseconds. Omitted on validation errors and timeouts. |
 
 ---
@@ -292,8 +294,8 @@ Each runtime script uses a unique hidden name in the workspace root. This preven
 - **Workspace isolation:** Ephemeral runs get a fresh UUID-named directory under `/tmp/agent-workspace/`. It is deleted after execution. Persistent runs use a stable namespace path and are never cleaned up by the handler.
 - **Credential isolation:** The child process environment is cleared (`env_clear()`) before setting explicit variables. MicroVM execution-role credentials are **not** leaked into sandbox code.
 - **Input limits:** Code is capped at 10 MB, environment variables at 256 KB total, and arguments at 64 items / 64 KB total.
-- **Timeout enforcement:** Uses `tokio::time::timeout` with `kill_on_drop` to terminate the child process if it exceeds the limit. Maximum configurable timeout is **300 seconds** (5 minutes).
-- **Known limitation:** On timeout, `kill_on_drop` terminates the direct `bash` child but does not reliably kill grandchild processes spawned by the script. A production-hardened version should use process groups (`setpgid`) and kill the entire group.
+- **Timeout enforcement:** Each run gets its own process group. On timeout the server SIGKILLs the whole group, so processes the script started die with it. A process that called `setsid` has left the group and survives. Maximum configurable timeout is **600 seconds** (10 minutes).
+- **Background processes:** A run returns once its script exits, even if something it backgrounded still holds stdout or stderr open. Output written after that is dropped.
 
 ---
 

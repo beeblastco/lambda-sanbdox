@@ -11,10 +11,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
+use axum::{
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::get,
+    routing::post,
+    Json, Router,
+};
 use lambda_microvm_agent_sandbox::{
     mount::{self, MountCredentials, Workspace, CREDENTIALS_DIR, CREDENTIALS_PATH},
-    run_exec, ExecRequest, ExecResponse,
+    run_exec, ExecRequest, ExecResponse, MAX_REQUEST_BYTES,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -48,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(health))
         .route("/exec", post(exec_handler))
         .route(CREDENTIALS_PATH, post(put_credentials_handler))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state.clone());
 
     let hooks_app = Router::new()
@@ -105,6 +112,7 @@ fn invalid_request(stderr: String) -> ExecResponse {
         stdout: String::new(),
         stderr,
         workspace: String::new(),
+        truncated: false,
         cpu_usec: None,
     }
 }
