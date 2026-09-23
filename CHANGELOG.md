@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The timeout cap is 600 s, matching the broods lambda provider. Anything over
+  300 s used to fail.
+- `/exec` accepts bodies up to 16 MB. axum's 2 MB default rejected requests well
+  under the 10 MB code cap with a plain-text 413.
+
 ### Added
 
 - Optional `browser` build target: the runtime image plus Playwright's Chrome
@@ -18,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A run that backgrounds a process (`cmd &`) now returns when its script exits.
   The background process inherited stdout and held the pipe open, so the run
-  waited out its full timeout and came back empty.
+  waited out its full timeout and came back empty. A background process that
+  keeps writing to those pipes now gets SIGPIPE; redirect its output to keep it.
 - A timeout now kills the run's whole process group, not just its direct child,
   and returns the output captured so far.
 - The response carries `truncated: true` when stdout or stderr passed its 256 KB
@@ -26,10 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently corrupt files.
 - Output is capped while it is read, so a runaway writer no longer grows the
   server's memory without bound.
-- `/exec` accepts bodies up to 16 MB. axum's 2 MB default rejected requests well
-  under the 10 MB code cap with a plain-text 413.
-- The timeout cap is 600 s, matching the broods lambda provider. Anything over
-  300 s used to fail.
 - A persistent workspace mount no longer dies with `Input/output error` an hour
   after boot. mount-s3 was started with the session's static keys, so the
   refreshed session the harness posts to `/workspace/credentials` never reached

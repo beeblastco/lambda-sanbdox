@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -39,7 +39,8 @@ const MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes, the broods lambda provider's
 // inherits the pipes and can hold them open for as long as it runs.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// Largest `/exec` body the server buffers: the code cap plus room for JSON escaping.
+/// Largest `/exec` body the server buffers: the 10 MB code cap plus headroom for
+/// the other fields and ordinary JSON escaping.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024; // 16 MB
 const DEFAULT_WORKSPACE_ROOT: &str = "/mnt/workspaces";
 
@@ -82,8 +83,8 @@ pub struct ExecResponse {
     pub stderr: String,
     pub workspace: String,
 
-    /// True when stdout or stderr passed its 256 KB cap and was cut. The cut text
-    /// ends in `...[truncated]`, so callers decoding it must check this first.
+    /// True when the returned stdout or stderr was cut to 256 KB. The cut text ends
+    /// in `...[truncated]`, so callers decoding it must check this first.
     pub truncated: bool,
 
     /// CPU time (user + system, including descendants) charged to the sandboxed
@@ -290,23 +291,7 @@ async fn execute_request(
         command.env(key, value);
     }
 
-    let cpu_before = children_cpu_usec();
-    let mut child = command.spawn().context("failed to run child process")?;
-    let stdout = CappedReader::spawn(child.stdout.take(), MAX_STDOUT_SIZE);
-    let stderr = CappedReader::spawn(child.stderr.take(), MAX_STDERR_SIZE);
-    let waited = timeout(Duration::from_millis(req.timeout_ms), child.wait()).await;
-    // Read right after the child is reaped, before the script removal and sync below.
-    let cpu_usec = children_cpu_usec().saturating_sub(cpu_before);
-    let status = match waited {
-        Ok(status) => Some(status.context("failed to wait for child process")?),
-        Err(_) => {
-            kill_process_group(&mut child).await;
-            None
-        }
-    };
-    let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
-    let (stdout, stdout_cut) = capped_text(&stdout, MAX_STDOUT_SIZE);
-    let (mut stderr, stderr_cut) = capped_text(&stderr, MAX_STDERR_SIZE);
+    let run = run_child(command, req.timeout_ms).await;
 
     // Remove this run's unique script so it never lingers in a persistent workspace.
     // Best-effort: the sync below flushes the unlink too.
@@ -332,7 +317,10 @@ async fn execute_request(
         }
     }
 
-    let Some(status) = status else {
+    let run = run?;
+    let (stdout, stdout_cut) = capped_text(&run.stdout, MAX_STDOUT_SIZE);
+    let (mut stderr, stderr_cut) = capped_text(&run.stderr, MAX_STDERR_SIZE);
+    let Some(status) = run.status else {
         if !stderr.is_empty() && !stderr.ends_with('\n') {
             stderr.push('\n');
         }
@@ -363,27 +351,65 @@ async fn execute_request(
         stderr,
         workspace: workspace.display().to_string(),
         truncated: stdout_cut || stderr_cut,
-        cpu_usec: Some(cpu_usec),
+        cpu_usec: Some(run.cpu_usec),
+    })
+}
+
+/// What one child run produced. `status` is `None` when the run timed out.
+struct ChildRun {
+    status: Option<ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    cpu_usec: u64,
+}
+
+/// Spawn `command`, wait up to `timeout_ms` for it, and collect its capped output.
+/// A timeout kills the child's whole process group.
+async fn run_child(mut command: Command, timeout_ms: u64) -> anyhow::Result<ChildRun> {
+    let cpu_before = children_cpu_usec();
+    let mut child = command.spawn().context("failed to run child process")?;
+    let stdout = CappedReader::spawn(
+        child.stdout.take().context("stdout not piped")?,
+        MAX_STDOUT_SIZE,
+    );
+    let stderr = CappedReader::spawn(
+        child.stderr.take().context("stderr not piped")?,
+        MAX_STDERR_SIZE,
+    );
+    let waited = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+    // Read right after the child is reaped, before the caller removes the script.
+    let cpu_usec = children_cpu_usec().saturating_sub(cpu_before);
+    let status = match waited {
+        Ok(status) => Some(status.context("failed to wait for child process")?),
+        // No wait after the kill: a child stuck in I/O on a hung FUSE mount ignores
+        // SIGKILL. kill_on_drop hands it to tokio's background reaper instead.
+        Err(_) => {
+            kill_process_group(&child);
+            None
+        }
+    };
+    let (stdout, stderr) = tokio::join!(stdout.finish(), stderr.finish());
+
+    Ok(ChildRun {
+        status,
+        stdout,
+        stderr,
+        cpu_usec,
     })
 }
 
 /// A child's stdout or stderr, read to EOF on its own task so the child never
-/// blocks on a full pipe. Keeps `cap + 1` bytes, one past the cap so the caller can
-/// tell a cut stream from one that fits exactly, and discards the rest.
+/// blocks on a full pipe. Keeps one byte past `cap`, so `capped_text` can tell
+/// a cut stream from one that fits exactly, and discards the rest.
 struct CappedReader {
     stop: oneshot::Sender<()>,
     task: JoinHandle<Vec<u8>>,
 }
 
 impl CappedReader {
-    fn spawn(pipe: Option<impl AsyncRead + Unpin + Send + 'static>, cap: usize) -> Self {
+    fn spawn(pipe: impl AsyncRead + Unpin + Send + 'static, cap: usize) -> Self {
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            match pipe {
-                Some(pipe) => read_capped(pipe, cap + 1, stopped).await,
-                None => Vec::new(),
-            }
-        });
+        let task = tokio::spawn(read_capped(pipe, cap + 1, stopped));
 
         Self { stop, task }
     }
@@ -391,8 +417,8 @@ impl CappedReader {
     /// The bytes read once the pipe closes, or after `OUTPUT_DRAIN_GRACE` if a
     /// process the child backgrounded still holds it open.
     async fn finish(mut self) -> Vec<u8> {
-        if let Ok(Ok(bytes)) = timeout(OUTPUT_DRAIN_GRACE, &mut self.task).await {
-            return bytes;
+        if let Ok(read) = timeout(OUTPUT_DRAIN_GRACE, &mut self.task).await {
+            return read.unwrap_or_default();
         }
         let _ = self.stop.send(());
 
@@ -401,16 +427,17 @@ impl CappedReader {
 }
 
 /// Decode captured output and cut it at `cap` bytes. Returns the text and whether
-/// it was cut.
+/// it was cut. Invalid UTF-8 decodes to 3-byte U+FFFD, so binary output can be cut
+/// below `cap` raw bytes.
 fn capped_text(bytes: &[u8], cap: usize) -> (String, bool) {
     let text = String::from_utf8_lossy(bytes);
 
     (truncate_string(&text, cap), text.len() > cap)
 }
 
-/// SIGKILL the child's process group, then reap the child. A process that called
-/// `setsid` has left the group and survives, as broods's detached jobs intend.
-async fn kill_process_group(child: &mut Child) {
+/// SIGKILL the child's process group. A process that called `setsid` has left the
+/// group and survives, as broods's detached jobs intend.
+fn kill_process_group(child: &Child) {
     if let Some(pid) = child.id() {
         // SAFETY: killpg only sends a signal. The child was spawned with
         // process_group(0), so its pid is the group id.
@@ -418,9 +445,10 @@ async fn kill_process_group(child: &mut Child) {
             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
         }
     }
-    let _ = child.wait().await;
 }
 
+/// Body of a `CappedReader` task: reads `pipe` until EOF or `stop`, keeping the
+/// first `keep` bytes.
 async fn read_capped(
     mut pipe: impl AsyncRead + Unpin,
     keep: usize,
