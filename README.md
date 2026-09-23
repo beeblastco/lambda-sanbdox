@@ -233,7 +233,7 @@ via `MICROVM_IMAGE_IDENTIFIER`.
 | `stdout` | string | Captured stdout (truncated to 256 KB). Partial output on a timeout. |
 | `stderr` | string | Captured stderr (truncated to 256 KB) |
 | `workspace` | string | Path to the workspace directory used for this run |
-| `truncated` | boolean | `true` if stdout or stderr passed 256 KB and was cut. Cut text ends in `...[truncated]`, so check this before decoding output. |
+| `truncated` | boolean | `true` if the returned stdout or stderr was cut to 256 KB. Cut text ends in `...[truncated]`, so check this before decoding output. |
 | `cpu_usec` | integer | CPU time (user + system, incl. descendants) charged to the run, in microseconds. Omitted on validation errors and timeouts. |
 
 ---
@@ -295,7 +295,7 @@ Each runtime script uses a unique hidden name in the workspace root. This preven
 - **Credential isolation:** The child process environment is cleared (`env_clear()`) before setting explicit variables. MicroVM execution-role credentials are **not** leaked into sandbox code.
 - **Input limits:** Code is capped at 10 MB, environment variables at 256 KB total, and arguments at 64 items / 64 KB total.
 - **Timeout enforcement:** Each run gets its own process group. On timeout the server SIGKILLs the whole group, so processes the script started die with it. A process that called `setsid` has left the group and survives. Maximum configurable timeout is **600 seconds** (10 minutes).
-- **Background processes:** A run returns once its script exits, even if something it backgrounded still holds stdout or stderr open. Output written after that is dropped.
+- **Background processes:** A run returns once its script exits, even if something it backgrounded still holds stdout or stderr open. The server then closes those pipes, so a background process that writes to them again gets SIGPIPE and usually dies. To keep one running, redirect its output: `setsid cmd >log 2>&1 &`. Its CPU time counts toward whichever run is active.
 
 ---
 
