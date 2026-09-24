@@ -71,6 +71,12 @@ RUN chmod +x /usr/local/bin/sandbox-server \
 # both be exposed — Lambda calls hooks over the guest network namespace.
 EXPOSE 8080 9000
 
+# For plain `docker run`. Lambda ignores it and drives readiness through the /ready hook.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+# Stays root: mount-s3 needs CAP_SYS_ADMIN for FUSE, and the MicroVM is the isolation boundary.
+# checkov:skip=CKV_DOCKER_3: the server mounts and unmounts FUSE workspaces, which requires root
 CMD ["/usr/local/bin/sandbox-server"]
 
 

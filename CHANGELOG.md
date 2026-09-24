@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The image declares a `HEALTHCHECK` against `/healthz`, so `docker ps` shows
+  whether a locally run container is serving. Lambda still uses the `/ready` hook.
 - Optional `browser` build target: the runtime image plus Playwright's Chrome
   Headless Shell (arm64) on PATH as `chromium`, for screenshots, DOM dumps and
   CDP automation. `docker build --target browser` builds it; the default target
@@ -23,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The benchmark report's per-category headings read `### Bash Runtime` instead
+  of `### ### Bash Runtime`.
 - A run that backgrounds a process (`cmd &`) now returns when its script exits.
   The background process inherited stdout and held the pipe open, so the run
   waited out its full timeout and came back empty. A background process that
