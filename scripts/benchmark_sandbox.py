@@ -62,35 +62,37 @@ def _load_env_file(path: str) -> dict:
     try:
         with open(path) as f:
             for line in f:
-                raw = line.strip()
-                # Strip inline comment (respecting quoted values)
-                in_quote = None
-                comment_pos = -1
-                for i, ch in enumerate(raw):
-                    if ch in ("'", '"') and (in_quote is None):
-                        in_quote = ch
-                    elif ch == in_quote:
-                        in_quote = None
-                    elif ch == '#' and in_quote is None:
-                        comment_pos = i
-                        break
-                if comment_pos >= 0:
-                    raw = raw[:comment_pos].strip()
-                if not raw or raw.startswith('#'):
-                    continue
-                if '=' not in raw:
-                    continue
-                key, _, val = raw.partition('=')
+                raw = _strip_inline_comment(line.strip())
+                key, sep, val = raw.partition('=')
                 key = key.strip()
-                val = val.strip()
-                # Strip surrounding quotes
-                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-                    val = val[1:-1]
-                if key:
-                    env[key] = val
+                if sep and key:
+                    env[key] = _unquote(val.strip())
     except FileNotFoundError:
         pass  # silently ignore missing .env files
+
     return env
+
+
+def _strip_inline_comment(raw: str) -> str:
+    """Cut `raw` at the first `#` that sits outside a quoted value."""
+    in_quote = None
+    for i, ch in enumerate(raw):
+        if ch in ("'", '"') and in_quote is None:
+            in_quote = ch
+        elif ch == in_quote:
+            in_quote = None
+        elif ch == '#' and in_quote is None:
+            return raw[:i].strip()
+
+    return raw
+
+
+def _unquote(val: str) -> str:
+    """Drop one pair of matching surrounding quotes from `val`."""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        return val[1:-1]
+
+    return val
 
 
 def _apply_env_to_args(args, env: dict) -> None:
@@ -121,6 +123,18 @@ def _apply_env_to_args(args, env: dict) -> None:
 #    check       : callable(response) → (bool, str)  (pass? , detail)
 #    category    : grouping label
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Test categories, in registration order.
+CAT_BASH = "Bash Runtime"
+CAT_PYTHON = "Python Runtime"
+CAT_NODE = "Node.js Runtime"
+CAT_ALIASES = "Runtime Aliases"
+CAT_EDGE = "Edge Cases"
+CAT_ERRORS = "Error Handling"
+CAT_TIMEOUT = "Timeout Enforcement"
+CAT_SECURITY = "Security & Isolation"
+CAT_STRESS = "Stress & Performance"
+CAT_PRODUCTION = "Production-like Scripts"
 
 TESTS: list[dict] = []
 
@@ -153,7 +167,7 @@ test(
     payload={"runtime": "bash", "code": "echo hello world", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "hello world" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -163,7 +177,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "line 3" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -173,7 +187,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "2" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -183,7 +197,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "nested" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -194,7 +208,7 @@ test(
     check=lambda r: (r.get("ok") is True and "args=3" in r.get("stdout", "")
                      and "hello" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -203,7 +217,7 @@ test(
     payload={"runtime": "bash", "code": "exit 42", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is False and r.get("exit_code") == 42,
                      f"exit_code={r.get('exit_code')}, ok={r.get('ok')}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 test(
@@ -212,7 +226,7 @@ test(
     payload={"code": "echo default", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and r.get("runtime") == "bash",
                      f"runtime={r.get('runtime')!r}"),
-    category="Bash Runtime",
+    category=CAT_BASH,
 )
 
 # 🟢 ─── Section 2: Python Runtime ─────────────────────────────────────────────
@@ -224,7 +238,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "hello from python" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Python Runtime",
+    category=CAT_PYTHON,
 )
 
 test(
@@ -235,7 +249,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "items" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Python Runtime",
+    category=CAT_PYTHON,
 )
 
 test(
@@ -246,7 +260,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "subproc" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Python Runtime",
+    category=CAT_PYTHON,
 )
 
 test(
@@ -257,7 +271,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "pi=3.14159" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Python Runtime",
+    category=CAT_PYTHON,
 )
 
 test(
@@ -267,7 +281,7 @@ test(
     check=lambda r: (r.get("ok") is False and r.get("exit_code") == 1
                      and "ZeroDivisionError" in r.get("stderr", ""),
                      f"exit_code={r.get('exit_code')}, stderr={r.get('stderr','')!r}"),
-    category="Python Runtime",
+    category=CAT_PYTHON,
 )
 
 # 🟢 ─── Section 3: Node.js Runtime ────────────────────────────────────────────
@@ -279,7 +293,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "hello from node" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 test(
@@ -290,7 +304,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "async done" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 test(
@@ -301,7 +315,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "promise works" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 test(
@@ -312,7 +326,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "caught" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 test(
@@ -323,7 +337,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "hi" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 test(
@@ -334,7 +348,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "subproc" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Node.js Runtime",
+    category=CAT_NODE,
 )
 
 # 🟢 ─── Section 4: Runtime Aliases ────────────────────────────────────────────
@@ -347,16 +361,19 @@ for alias, rt, expected in [
     ("alias_js", "js", "js alias"),
     ("alias_javascript", "javascript", "javascript alias"),
 ]:
+    if 'py' in rt:
+        alias_code = f"print('{expected}')"
+    elif 'node' in rt or rt in ('js', 'javascript'):
+        alias_code = f"console.log('{expected}')"
+    else:
+        alias_code = f"echo {expected}"
     test(
         name=alias,
         description=f"Runtime alias: '{rt}'",
-        payload={"runtime": rt, "code": f"print('{expected}')" if 'py' in rt
-                 else f"console.log('{expected}')" if 'node' in rt or rt in ('js', 'javascript')
-                 else f"echo {expected}",
-                 "timeout_ms": 30000},
+        payload={"runtime": rt, "code": alias_code, "timeout_ms": 30000},
         check=lambda r, exp=expected: (r.get("ok") is True and exp in r.get("stdout", ""),
                                         f"stdout={r.get('stdout','')!r}"),
-        category="Runtime Aliases",
+        category=CAT_ALIASES,
     )
 
 # 🟢 ─── Section 5: Edge Cases ─────────────────────────────────────────────────
@@ -369,7 +386,7 @@ test(
     check=lambda r: (r.get("ok") is True and "🚀" in r.get("stdout", "")
                      and "世界" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 test(
@@ -380,7 +397,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "🎉" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 test(
@@ -391,7 +408,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "🎉" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 test(
@@ -400,7 +417,7 @@ test(
     payload={"runtime": "bash", "code": "", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and r.get("stdout", "") == "",
                      f"ok={r.get('ok')}, stdout={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 test(
@@ -412,7 +429,7 @@ test(
     check=lambda r: (r.get("ok") is True and "content" in r.get("stdout", "")
                      and "cleaned" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 test(
@@ -426,7 +443,7 @@ test(
         and len(r.get("stdout", "").strip()) > 0
         and _safe_parse_int(r.get("stdout", "").strip(), 0) > 100,
         f"base64 length={r.get('stdout','')!r}"),
-    category="Edge Cases",
+    category=CAT_EDGE,
 )
 
 # 🟢 ─── Section 6: Error Handling ─────────────────────────────────────────────
@@ -438,7 +455,7 @@ test(
     check=lambda r: (r.get("ok") is False and "missing field" in r.get("stderr", "")
                      and "code" in r.get("stderr", ""),
                      f"stderr={r.get('stderr','')!r}"),
-    category="Error Handling",
+    category=CAT_ERRORS,
 )
 
 test(
@@ -447,7 +464,7 @@ test(
     payload={"runtime": "ruby", "code": "puts 'hi'", "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is False and "unsupported runtime" in r.get("stderr", ""),
                      f"stderr={r.get('stderr','')!r}"),
-    category="Error Handling",
+    category=CAT_ERRORS,
 )
 
 test(
@@ -457,7 +474,7 @@ test(
     check=lambda r: (r.get("ok") is False and r.get("exit_code") == 1
                      and "ZeroDivisionError" in r.get("stderr", ""),
                      f"exit_code={r.get('exit_code')}"),
-    category="Error Handling",
+    category=CAT_ERRORS,
 )
 
 test(
@@ -468,7 +485,7 @@ test(
     check=lambda r: (r.get("ok") is False and r.get("exit_code", 0) != 0
                      and "test-err" in r.get("stderr", ""),
                      f"exit_code={r.get('exit_code')}, stderr={r.get('stderr','')!r}"),
-    category="Error Handling",
+    category=CAT_ERRORS,
 )
 
 # 🟢 ─── Section 7: Timeout Enforcement ────────────────────────────────────────
@@ -482,7 +499,7 @@ test(
                      and r.get("duration_ms", 0) < 5000
                      and "timed out" in r.get("stderr", "").lower(),
                      f"timed_out={r.get('timed_out')}, duration_ms={r.get('duration_ms')}"),
-    category="Timeout Enforcement",
+    category=CAT_TIMEOUT,
 )
 
 test(
@@ -493,7 +510,7 @@ test(
     check=lambda r: (r.get("timed_out") is True
                      and r.get("duration_ms", 0) < 7000,
                      f"timed_out={r.get('timed_out')}, duration_ms={r.get('duration_ms')}"),
-    category="Timeout Enforcement",
+    category=CAT_TIMEOUT,
 )
 
 # 🟢 ─── Section 8: Security & Isolation ───────────────────────────────────────
@@ -507,7 +524,7 @@ test(
                      and "sbx_user" in r.get("stdout", "")
                      and "root" not in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Security & Isolation",
+    category=CAT_SECURITY,
 )
 
 test(
@@ -519,7 +536,7 @@ test(
                      and "Permission denied" in r.get("stdout", "")
                      and "done" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Security & Isolation",
+    category=CAT_SECURITY,
 )
 
 test(
@@ -529,7 +546,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and "/tmp/agent-workspace/" in r.get("stdout", ""),
                      f"pwd={r.get('stdout','')!r}, workspace={r.get('workspace','')!r}"),
-    category="Security & Isolation",
+    category=CAT_SECURITY,
 )
 
 test(
@@ -542,7 +559,7 @@ test(
                      and ("CapEff:\t0000000000000000" in r.get("stdout", "")
                           or "CapEff" not in r.get("stdout", "")),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Security & Isolation",
+    category=CAT_SECURITY,
 )
 
 test(
@@ -553,7 +570,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and "/tmp/agent-workspace/" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Security & Isolation",
+    category=CAT_SECURITY,
 )
 
 # 🟢 ─── Section 9: Stress & Performance ───────────────────────────────────────
@@ -567,7 +584,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and len(r.get("stdout", "").split('\n')) >= 1000,
                      f"lines={len(r.get('stdout','').split(chr(10)))}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -578,7 +595,7 @@ test(
              "timeout_ms": 30000},
     check=lambda r: (r.get("ok") is True and "done" in r.get("stdout", ""),
                      f"duration_ms={r.get('duration_ms')}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -590,7 +607,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and "sum=" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -601,7 +618,7 @@ test(
              "timeout_ms": 60000},
     check=lambda r: (r.get("ok") is True and "2262" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -613,7 +630,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and "allocated 1000000" in r.get("stdout", ""),
                      f"stdout={r.get('stdout','')!r}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -625,7 +642,7 @@ test(
                      and r.get("duration_ms", 0) >= 4500
                      and r.get("duration_ms", 0) <= 15000,
                      f"duration_ms={r.get('duration_ms')}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 test(
@@ -636,7 +653,7 @@ test(
     check=lambda r: (r.get("ok") is True
                      and r.get("duration_ms", 0) >= 9500,
                      f"duration_ms={r.get('duration_ms')}"),
-    category="Stress & Performance",
+    category=CAT_STRESS,
 )
 
 
@@ -647,13 +664,6 @@ test(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Helper: named checks for production scripts ──────────────────────────────
-
-def _check_stdout_contains(expected: str):
-    """Factory: returns a check that ensures `expected` is found in stdout."""
-    return lambda r: (
-        r.get("ok") is True and expected in r.get("stdout", ""),
-        f"stdout={r.get('stdout','')!r}")
-
 
 def _check_stdout_all(expected_parts: list[str]):
     """Factory: returns a check that ensures ALL expected strings are in stdout."""
@@ -671,7 +681,7 @@ def _check_stdout_all(expected_parts: list[str]):
 test(
     name="bash_log_parser",
     description="Bash: Apache access log parsing pipeline",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "bash", "code": "cat > access.log << 'LOGDATA'\n192.168.1.1 - - [10/Jan/2024:08:00:01 +0000] \"GET /api/users HTTP/1.1\" 200 1234\n192.168.1.2 - - [10/Jan/2024:08:00:05 +0000] \"GET /api/items HTTP/1.1\" 404 56\n192.168.1.1 - - [10/Jan/2024:08:00:10 +0000] \"POST /api/users HTTP/1.1\" 201 78\n192.168.1.3 - - [10/Jan/2024:08:00:15 +0000] \"GET /api/users HTTP/1.1\" 200 5678\n192.168.1.1 - - [10/Jan/2024:08:00:20 +0000] \"GET /api/users HTTP/1.1\" 500 12\n192.168.1.4 - - [10/Jan/2024:08:00:25 +0000] \"DELETE /api/sessions HTTP/1.1\" 204 0\n192.168.1.2 - - [10/Jan/2024:08:00:30 +0000] \"GET /api/items HTTP/1.1\" 304 0\n192.168.1.5 - - [10/Jan/2024:08:00:35 +0000] \"POST /api/auth HTTP/1.1\" 200 234\n192.168.1.1 - - [10/Jan/2024:08:00:40 +0000] \"GET /api/users HTTP/1.1\" 200 89\n192.168.1.3 - - [10/Jan/2024:08:00:45 +0000] \"PUT /api/users/42 HTTP/1.1\" 200 45\nLOGDATA\nTOTAL=$(wc -l < access.log)\nUNIQUE_IPS=$(awk '{print $1}' access.log | sort -u | wc -l)\nOK200=$(grep -c ' 200 ' access.log)\nCLIENT_ERR=$(grep -c ' 4[0-9][0-9] ' access.log)\nSERVER_ERR=$(grep -c ' 5[0-9][0-9] ' access.log)\nTOP_IP=$(awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')\nTOP_IP_COUNT=$(awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -1 | awk '{print $1}')\necho \"total=$TOTAL unique_ips=$UNIQUE_IPS ok=$OK200 client_errors=$CLIENT_ERR server_errors=$SERVER_ERR top_ip=$TOP_IP top_count=$TOP_IP_COUNT\"\nrm -f access.log",
              "timeout_ms": 30000},
     check=_check_stdout_all(["total=10", "unique_ips=5", "ok=5", "client_errors=2",
@@ -681,7 +691,7 @@ test(
 test(
     name="bash_file_batch_rename",
     description="Bash: batch file rename with sed substitution",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "bash", "code": """mkdir -p data
 # Create report files with date pattern
 for d in 20240101 20240102 20240103; do
@@ -709,7 +719,7 @@ rm -rf data""",
 test(
     name="bash_data_pipeline",
     description="Bash: CSV generation → sort → uniq → awk pipeline",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "bash", "code": """# Generate sales CSV: product,category,amount
 cat > sales.csv << 'CSVDATA'
 widget,gadgets,100
@@ -743,7 +753,7 @@ rm -f sales.csv""",
 test(
     name="bash_backup_restore",
     description="Bash: tar backup → restore to new dir → verify",
-    category="Production-like Scripts",    payload={"runtime": "bash", "code": """mkdir -p project/src project/docs
+    category=CAT_PRODUCTION,    payload={"runtime": "bash", "code": """mkdir -p project/src project/docs
 # Create source files
 echo 'def hello():\n    return "hello"' > project/src/main.py
 echo 'import main\nprint(main.hello())' > project/src/app.py
@@ -766,7 +776,7 @@ cd .. && rm -rf project backup.tar.gz restore""",
 test(
     name="bash_csv_aggregation",
     description="Bash: CSV sales analysis with awk aggregation",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "bash", "code": """cat > orders.csv << 'CSV'
 order_id,customer,amount,region,date
 ORD001,Alice,150.00,NA,2024-01-15
@@ -802,7 +812,7 @@ rm -f orders.csv""",
 test(
     name="python_csv_processor",
     description="Python: CSV parsing, filtering, and aggregation",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "python", "code": """import csv, io, json
 
 CSV_DATA = \"\"\"name,role,salary,department
@@ -850,7 +860,7 @@ print(json.dumps(result, indent=2))""",
 test(
     name="python_data_transform",
     description="Python: complex dict/list data transformation pipeline",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "python", "code": """import json
 
 # Simulate API response processing
@@ -899,7 +909,7 @@ print(json.dumps(result))""",
 test(
     name="python_config_parser",
     description="Python: env config parsing with validation and structured output",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "python", "code": """import json, os, re
 
 # Simulate environment variable config parsing
@@ -964,7 +974,7 @@ print(json.dumps(result, indent=2))""",
 test(
     name="python_log_analyzer",
     description="Python: structured log analysis with regex and stats",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "python", "code": """import json, re, statistics
 
 LOG_LINES = \"\"\"2024-01-15T10:00:01 INFO  request_id=abc123 method=GET path=/api/users status=200 duration_ms=45
@@ -1032,7 +1042,7 @@ print(json.dumps(result, indent=2))""",
 test(
     name="python_api_response",
     description="Python: generate paginated JSON API response",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "python", "code": """import json, math
 
 ITEMS = [
@@ -1090,7 +1100,7 @@ print(json.dumps(response, indent=2))""",
 test(
     name="node_data_pipeline",
     description="Node.js: array data transformation pipeline (map/filter/reduce)",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "node", "code": """// Simulate ETL-style data transformation
 const rawData = Array.from({length: 200}, (_, i) => ({
   id: i + 1,
@@ -1144,7 +1154,7 @@ console.log(JSON.stringify(result, null, 2));""",
 test(
     name="node_config_loader",
     description="Node.js: configuration loading with validation and defaults",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "node", "code": """// Simulate a config loader with env var parsing, defaults, and validation
 const rawConfig = {
   APP_NAME: 'data-processor',
@@ -1215,7 +1225,7 @@ console.log(JSON.stringify(config, null, 2));""",
 test(
     name="node_json_api",
     description="Node.js: generate paginated JSON API with nested resources",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "node", "code": """// Generate a paginated JSON API response with nested resources
 const products = Array.from({length: 55}, (_, i) => ({
   id: `prod_${i + 1}`,
@@ -1280,7 +1290,7 @@ console.log(JSON.stringify(response, null, 2));""",
 test(
     name="node_file_batch",
     description="Node.js: batch file creation, transformation, and summary",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "node", "code": """const fs = require('fs');
 const path = require('path');
 
@@ -1346,7 +1356,7 @@ fs.rmSync('invoices', { recursive: true, force: true });""",
 test(
     name="node_event_processing",
     description="Node.js: event emitter with async processing pipeline",
-    category="Production-like Scripts",
+    category=CAT_PRODUCTION,
     payload={"runtime": "node", "code": """const EventEmitter = require('events');
 
 // Simulate an event-driven processing pipeline
@@ -1576,45 +1586,82 @@ def generate_report(results: list[dict], bench_results: list[dict],
                     function_arn: str, region: str,
                     wall_seconds: float) -> str:
     """Produce a complete markdown report."""
-    lines = []
-    def sep():
-        return lines.append("")
-
-    def h1(t): lines.append(f"# {t}")
-    def h2(t): lines.append(f"## {t}")
-    def h3(t): lines.append(f"### {t}")
-    def code(t): lines.append(f"```\n{t}\n```")
-    def p(t): lines.append(t)
-
-    # ── Header ───────────────────────────────────────────────────────────
-    h1("🧪 AWS Lambda MicroVM Agent Sandbox — Test & Benchmark Report")
-    sep()
-    p(f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    p(f"**Target:** `{function_arn}`")
-    p(f"**Region:** `{region}`")
-    p(f"**Total wall time:** `{wall_seconds:.1f}s`")
-    sep()
-    p("---")
-    sep()
-
-    # ── Overall summary ───────────────────────────────────────────────────
     total = len(results)
     passed = sum(1 for r in results if r["pass"])
     failed = total - passed
     rate = (passed / total * 100) if total else 0
 
-    h2("📊 Overall Results")
-    sep()
-    p("| Metric | Value |")
-    p("|--------|-------|")
-    p(f"| **Total Tests** | {total} |")
-    p(f"| **Passed** | {passed} |")
-    p(f"| **Failed** | {failed} |")
-    p(f"| **Pass Rate** | {rate:.1f}% |")
-    p(f"| **Benchmarks** | {len(bench_results)} |")
-    sep()
+    lines = [
+        "# 🧪 AWS Lambda MicroVM Agent Sandbox — Test & Benchmark Report",
+        "",
+        f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"**Target:** `{function_arn}`",
+        f"**Region:** `{region}`",
+        f"**Total wall time:** `{wall_seconds:.1f}s`",
+        "",
+        "---",
+        "",
+        "## 📊 Overall Results",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| **Total Tests** | {total} |",
+        f"| **Passed** | {passed} |",
+        f"| **Failed** | {failed} |",
+        f"| **Pass Rate** | {rate:.1f}% |",
+        f"| **Benchmarks** | {len(bench_results)} |",
+        "",
+    ]
+    lines += _report_categories(results)
+    lines += _report_details(results)
+    lines += _report_benchmarks(bench_results)
+    lines += [
+        "## 💻 Environment Info",
+        "",
+        "| Property | Value |",
+        "|----------|-------|",
+        f"| Python | `{sys.version}` |",
+        f"| Platform | `{sys.platform}` |",
+        f"| Timestamp | `{datetime.now(timezone.utc).isoformat()}` |",
+        "",
+        "---",
+        f"*Report generated by `scripts/benchmark_sandbox.py` — {total} tests, "
+        f"{passed} passed, {failed} failed ({rate:.0f}% success)*",
+        "",
+    ]
 
-    # ── By category ──────────────────────────────────────────────────────
+    return "\n".join(lines)
+
+
+def _report_benchmarks(bench_results: list[dict]) -> list[str]:
+    """Benchmark table plus cold/warm and per-runtime analysis."""
+    lines = ["## ⚡ Performance Benchmarks", ""]
+    if not bench_results:
+        return lines + ["*No benchmark data collected.*", ""]
+
+    all_durs = [d for b in bench_results for d in b.get("all_runs") or []]
+    max_bench_dur = max(all_durs) if all_durs else 5000
+
+    lines += [
+        "| Benchmark | Result | Avg | Cold | Warm Avg | Bar (avg) |",
+        "|---|---|---|---|---|---|",
+    ]
+    for b in bench_results:
+        dur = b.get("duration_ms", 0)
+        ok_str = PASS_EMOJI if b.get("ok") else FAIL_EMOJI
+        bar = _duration_bar(dur, max_bench_dur)
+        cold_str = f"{b['cold_duration_ms']:.0f}ms" if b.get("cold_duration_ms") is not None else "—"
+        warm_str = f"{b['warm_avg_ms']:.0f}ms" if b.get("warm_avg_ms") is not None else "—"
+        lines.append(f"| {b['name']} | {ok_str} | {dur:.0f}ms | {cold_str} | {warm_str} | {bar} |")
+    lines.append("")
+    lines += _report_cold_warm(bench_results)
+    lines += _report_runtime_impact(bench_results)
+
+    return lines
+
+
+def _report_categories(results: list[dict]) -> list[str]:
+    """Pass/fail table per test category, sorted by name."""
     categories = {}
     for r in results:
         cat = r.get("category", "Uncategorized")
@@ -1623,134 +1670,111 @@ def generate_report(results: list[dict], bench_results: list[dict],
         if r["pass"]:
             categories[cat]["passed"] += 1
 
-    h2("📁 Results by Category")
-    sep()
-    p("| Category | Tests | Passed | Failed | Pass Rate |")
-    p("|---|---|---|---|---|")
+    lines = [
+        "## 📁 Results by Category",
+        "",
+        "| Category | Tests | Passed | Failed | Pass Rate |",
+        "|---|---|---|---|---|",
+    ]
     for cat, stats in sorted(categories.items()):
         fail = stats["total"] - stats["passed"]
         cr = (stats["passed"] / stats["total"] * 100) if stats["total"] else 0
-        p(f"| {cat} | {stats['total']} | {stats['passed']} | {fail} | {cr:.0f}% |")
-    sep()
+        lines.append(f"| {cat} | {stats['total']} | {stats['passed']} | {fail} | {cr:.0f}% |")
+    lines.append("")
 
-    # ── Detailed test results ─────────────────────────────────────────────
-    h2("🔍 Detailed Test Results")
-    sep()
+    return lines
 
+
+def _report_cold_warm(bench_results: list[dict]) -> list[str]:
+    """Detected cold starts and aggregate warm-run statistics."""
+    lines = ["### ❄️  Cold vs 🔥 Warm Start Analysis", ""]
+
+    cold_benchmarks = [b for b in bench_results if b.get("is_cold_start")]
+    if cold_benchmarks:
+        lines.append("**Identified cold starts** (first run faster >1.5x median of all runs):")
+        for b in cold_benchmarks:
+            lines.append(
+                f"- {b['name']}: cold `{b['cold_duration_ms']:.0f}ms` vs "
+                f"warm avg `{b['warm_avg_ms']:.0f}ms` "
+                f"({b['cold_duration_ms'] / b['warm_avg_ms']:.1f}x slowdown)")
+        lines.append("")
+
+    all_warm = [d for b in bench_results for d in b.get("warm_durations_ms") or []]
+    if all_warm:
+        sorted_warm = sorted(all_warm)
+        p95_idx = min(int(len(sorted_warm) * 0.95), len(sorted_warm) - 1)
+        lines += [
+            f"**Aggregate warm exec stats** (across {len(all_warm)} runs):",
+            f"- **Average:** `{sum(all_warm) / len(all_warm):.0f}ms`",
+            f"- **Median:** `{median(all_warm):.0f}ms`",
+            f"- **P95:** `{sorted_warm[p95_idx]:.0f}ms`",
+        ]
+        if len(all_warm) > 2:
+            lines.append(f"- **Std deviation:** `{stdev(all_warm):.0f}ms`")
+        lines.append("")
+
+    return lines
+
+
+def _report_details(results: list[dict]) -> list[str]:
+    """One line per test, grouped under a heading per category."""
+    lines = ["## 🔍 Detailed Test Results", ""]
     current_cat = None
     for r in results:
         if r["category"] != current_cat:
             current_cat = r["category"]
-            h3(f"### {current_cat}")
-            sep()
+            lines += [f"### {current_cat}", ""]
 
         icon = PASS_EMOJI if r["pass"] else FAIL_EMOJI
         detail = r.get("detail", "").strip()
         dur = r.get("duration_ms")
         dur_str = f" — `{dur}ms`" if dur is not None else ""
 
-        p(f"- {icon} **{r['name']}:** {r['description']}{dur_str}")
+        lines.append(f"- {icon} **{r['name']}:** {r['description']}{dur_str}")
         if detail:
-            p(f"  - _{detail}_")
-        sep()
+            lines.append(f"  - _{detail}_")
+        lines.append("")
 
-    # ── Benchmark results ─────────────────────────────────────────────────
-    h2("⚡ Performance Benchmarks")
-    sep()
+    return lines
 
-    if bench_results:
-        all_durs = []
-        for b in bench_results:
-            if b.get("all_runs"):
-                all_durs.extend(b["all_runs"])
 
-        max_bench_dur = max(all_durs) if all_durs else 5000
+def _report_runtime_impact(bench_results: list[dict]) -> list[str]:
+    """Cold vs warm slowdown per benchmark, grouped by runtime."""
+    runtime_groups = {
+        "Bash": [b for b in bench_results if "Bash:" in b["name"]],
+        "Python": [b for b in bench_results if "Python:" in b["name"]],
+        "Node.js": [b for b in bench_results if "Node.js:" in b["name"]],
+    }
+    lines = [
+        "### Per-Runtime Cold Start Impact",
+        "",
+        "| Runtime | Benchmark | Cold (ms) | Warm Avg (ms) | Slowdown |",
+        "|---|---|---|---|---|",
+    ]
+    for rt, benches in runtime_groups.items():
+        for b in benches:
+            c = b.get("cold_duration_ms")
+            w = b.get("warm_avg_ms")
+            if c and w:
+                ratio = c / w
+                lines.append(f"| {rt} | {b['name']} | {c:.0f} | {w:.0f} | {_slowdown_icon(ratio)} {ratio:.1f}x |")
+            elif c:
+                lines.append(f"| {rt} | {b['name']} | {c:.0f} | — | — |")
+        if not benches:
+            lines.append(f"| {rt} | — | — | — | — |")
+    lines.append("")
 
-        p("| Benchmark | Result | Avg | Cold | Warm Avg | Bar (avg) |")
-        p("|---|---|---|---|---|---|")
-        for b in bench_results:
-            dur = b.get("duration_ms", 0)
-            ok_str = PASS_EMOJI if b.get("ok") else FAIL_EMOJI
-            bar = _duration_bar(dur, max_bench_dur)
-            cold_str = f"{b['cold_duration_ms']:.0f}ms" if b.get("cold_duration_ms") is not None else "—"
-            warm_str = f"{b['warm_avg_ms']:.0f}ms" if b.get("warm_avg_ms") is not None else "—"
-            p(f"| {b['name']} | {ok_str} | {dur:.0f}ms | {cold_str} | {warm_str} | {bar} |")
-        sep()
+    return lines
 
-        # Cold vs warm analysis
-        h3("❄️  Cold vs 🔥 Warm Start Analysis")
-        sep()
 
-        cold_benchmarks = [b for b in bench_results if b.get("is_cold_start")]
-        if cold_benchmarks:
-            p("**Identified cold starts** (first run faster >1.5x median of all runs):")
-            for b in cold_benchmarks:
-                p(f"- {b['name']}: cold `{b['cold_duration_ms']:.0f}ms` vs "
-                  f"warm avg `{b['warm_avg_ms']:.0f}ms` "
-                  f"({b['cold_duration_ms'] / b['warm_avg_ms']:.1f}x slowdown)")
-            sep()
+def _slowdown_icon(ratio: float) -> str:
+    """Emoji for a cold/warm ratio: fast, cold, or very cold."""
+    if ratio < 1.3:
+        return "🚀"
+    if ratio < 2.0:
+        return "❄️"
 
-        # Aggregate warm duration statistics across all benchmarks
-        all_warm = []
-        for b in bench_results:
-            if b.get("warm_durations_ms"):
-                all_warm.extend(b["warm_durations_ms"])
-        if all_warm:
-            warm_avg = sum(all_warm) / len(all_warm)
-            p(f"**Aggregate warm exec stats** (across {len(all_warm)} runs):")
-            p(f"- **Average:** `{warm_avg:.0f}ms`")
-            p(f"- **Median:** `{median(all_warm):.0f}ms`")
-            sorted_warm = sorted(all_warm)
-            p95_idx = min(int(len(sorted_warm) * 0.95), len(sorted_warm) - 1)
-            p(f"- **P95:** `{sorted_warm[p95_idx]:.0f}ms`")
-            if len(all_warm) > 2:
-                p(f"- **Std deviation:** `{stdev(all_warm):.0f}ms`")
-            sep()
-
-        # Per-runtime cold start breakdown
-        h3("Per-Runtime Cold Start Impact")
-        sep()
-        runtime_groups = {
-            "Bash": [b for b in bench_results if "Bash:" in b["name"]],
-            "Python": [b for b in bench_results if "Python:" in b["name"]],
-            "Node.js": [b for b in bench_results if "Node.js:" in b["name"]],
-        }
-        p("| Runtime | Benchmark | Cold (ms) | Warm Avg (ms) | Slowdown |")
-        p("|---|---|---|---|---|")
-        for rt, benches in runtime_groups.items():
-            for b in benches:
-                c = b.get("cold_duration_ms")
-                w = b.get("warm_avg_ms")
-                if c and w:
-                    ratio = c / w
-                    arrow = "🚀" if ratio < 1.3 else "❄️" if ratio < 2.0 else "🧊"
-                    p(f"| {rt} | {b['name']} | {c:.0f} | {w:.0f} | {arrow} {ratio:.1f}x |")
-                elif c:
-                    p(f"| {rt} | {b['name']} | {c:.0f} | — | — |")
-            if not benches:
-                p(f"| {rt} | — | — | — | — |")
-        sep()
-    else:
-        p("*No benchmark data collected.*")
-        sep()
-
-    # ── System info ───────────────────────────────────────────────────────
-    h2("💻 Environment Info")
-    sep()
-    p("| Property | Value |")
-    p("|----------|-------|")
-    p(f"| Python | `{sys.version}` |")
-    p(f"| Platform | `{sys.platform}` |")
-    p(f"| Timestamp | `{datetime.now(timezone.utc).isoformat()}` |")
-    sep()
-
-    # ── Footer ────────────────────────────────────────────────────────────
-    p("---")
-    p(f"*Report generated by `scripts/benchmark_sandbox.py` — {total} tests, "
-      f"{passed} passed, {failed} failed ({rate:.0f}% success)*")
-    sep()
-
-    return "\n".join(lines)
+    return "🧊"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1840,6 +1864,10 @@ def _build_json_output(results: list[dict], bench_results: list[dict],
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    """Parse CLI and .env config, run all tests and benchmarks, write the reports.
+
+    Exits 1 when any test fails, so CI can gate on it.
+    """
     parser = argparse.ArgumentParser(
         description="AWS Lambda MicroVM Agent Sandbox — Benchmark & Test Suite")
     group = parser.add_mutually_exclusive_group()
@@ -1966,7 +1994,7 @@ def main():
     for bench in BENCHMARKS:
         name = bench["name"]
         all_runs: list[float] = []
-        for run_idx in range(args.benchmark_runs):
+        for _ in range(args.benchmark_runs):
             resp = invoker(bench["payload"])
             dur = resp.get("duration_ms")
             if dur is not None:
