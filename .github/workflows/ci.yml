@@ -24,6 +24,10 @@ env:
   # creation). Defaults to eu-central-1 when the repo variable is unset.
   ECR_REGIONS: ${{ vars.ECR_REGIONS || 'eu-central-1' }}
 
+# Read-only by default. Jobs that push images widen this for themselves.
+permissions:
+  contents: read
+
 jobs:
   # ─── Rust checks (always runs) ───
   rust-checks:
