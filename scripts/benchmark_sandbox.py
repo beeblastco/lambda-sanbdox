@@ -1691,7 +1691,7 @@ def _report_cold_warm(bench_results: list[dict]) -> list[str]:
 
     cold_benchmarks = [b for b in bench_results if b.get("is_cold_start")]
     if cold_benchmarks:
-        lines.append("**Identified cold starts** (first run faster >1.5x median of all runs):")
+        lines.append("**Identified cold starts** (first run >1.5x the warm median, or >2x the warm average with fewer than 3 warm runs):")
         for b in cold_benchmarks:
             lines.append(
                 f"- {b['name']}: cold `{b['cold_duration_ms']:.0f}ms` vs "
