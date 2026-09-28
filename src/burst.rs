@@ -14,8 +14,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-// A longer gap between samples is a suspend, not a busy second: the VM was frozen,
-// so it counts as one interval rather than billing memory for the whole gap.
+// A longer gap between samples is a suspend: the VM was frozen, so the gap counts
+// as one sample interval rather than billing memory for the whole of it.
 const MAX_SAMPLE_GAP: Duration = Duration::from_secs(5);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -42,12 +42,12 @@ pub struct Sample {
     pub memory_used_bytes: u64,
 }
 
-/// Adds each interval's excess to the totals. Pure, so the sampler and the tests
-/// drive it the same way.
+/// Adds each interval's excess to the totals. Pure, so the sampler, `/exec` and
+/// the tests drive it the same way.
 #[derive(Debug)]
 pub struct BurstMeter {
     baseline: Baseline,
-    last_cpu_usec: Option<u64>,
+    last: Option<(Instant, u64)>,
     totals: BurstTotals,
 }
 
@@ -55,21 +55,26 @@ impl BurstMeter {
     pub fn new(baseline: Baseline) -> Self {
         Self {
             baseline,
-            last_cpu_usec: None,
+            last: None,
             totals: BurstTotals::default(),
         }
     }
 
-    /// Record `elapsed` since the previous sample. CPU above the baseline is the
-    /// CPU time used in the interval minus what the baseline vCPUs could give;
-    /// memory above it is billed for the interval at the reading's level.
-    pub fn record(&mut self, elapsed: Duration, sample: Sample) {
-        let seconds = elapsed.min(MAX_SAMPLE_GAP).as_secs_f64();
-        if let Some(last) = self.last_cpu_usec {
-            let used = sample.cpu_usec.saturating_sub(last) as f64 / 1_000_000.0;
-            self.totals.vcpu_seconds += (used - seconds * self.baseline.vcpu).max(0.0);
+    /// Record a sample taken at `at`. The first one only sets the starting point.
+    /// CPU above the baseline is the CPU time used since the previous sample minus
+    /// what the baseline vCPUs could give; memory above it is billed for the
+    /// interval at the reading's level.
+    pub fn record(&mut self, at: Instant, sample: Sample) {
+        let Some((last_at, last_cpu_usec)) = self.last.replace((at, sample.cpu_usec)) else {
+            return;
+        };
+        let mut elapsed = at.saturating_duration_since(last_at);
+        if elapsed > MAX_SAMPLE_GAP {
+            elapsed = SAMPLE_INTERVAL;
         }
-        self.last_cpu_usec = Some(sample.cpu_usec);
+        let seconds = elapsed.as_secs_f64();
+        let used = sample.cpu_usec.saturating_sub(last_cpu_usec) as f64 / 1_000_000.0;
+        self.totals.vcpu_seconds += (used - seconds * self.baseline.vcpu).max(0.0);
         let extra_bytes = sample.memory_used_bytes as f64 - self.baseline.memory_bytes;
         self.totals.gb_seconds += (extra_bytes / GIB).max(0.0) * seconds;
     }
@@ -79,8 +84,11 @@ impl BurstMeter {
     }
 }
 
-/// The totals so far, for the `/exec` response. Zero before the sampler starts.
+/// The totals up to now, for the `/exec` response. Takes a sample first, so an
+/// exec that finished between sampler ticks is counted.
 pub fn totals() -> BurstTotals {
+    sample_now();
+
     meter()
         .lock()
         .map(|meter| meter.totals())
@@ -91,22 +99,16 @@ pub fn totals() -> BurstTotals {
 pub fn spawn_sampler() {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
-        let mut last = Instant::now();
         loop {
             interval.tick().await;
-            let now = Instant::now();
-            if let Some(sample) = read_sample() {
-                if let Ok(mut meter) = meter().lock() {
-                    meter.record(now - last, sample);
-                }
-            }
-            last = now;
+            sample_now();
         }
     });
 }
 
 /// Baseline from `SANDBOX_BASELINE_VCPU` and `SANDBOX_BASELINE_MEMORY_MB`, else the
-/// MicroVM default of 1 vCPU / 2 GiB.
+/// MicroVM default of 1 vCPU / 2 GiB. A value that is not a finite, positive
+/// number falls back to the default.
 fn baseline_from_env() -> Baseline {
     let vcpu = env_number("SANDBOX_BASELINE_VCPU").unwrap_or(1.0);
     let memory_mb = env_number("SANDBOX_BASELINE_MEMORY_MB").unwrap_or(2048.0);
@@ -118,12 +120,21 @@ fn baseline_from_env() -> Baseline {
 }
 
 fn env_number(name: &str) -> Option<f64> {
-    std::env::var(name).ok()?.parse::<f64>().ok()
+    parse_baseline(&std::env::var(name).ok()?)
 }
 
 fn meter() -> &'static Mutex<BurstMeter> {
     static METER: OnceLock<Mutex<BurstMeter>> = OnceLock::new();
     METER.get_or_init(|| Mutex::new(BurstMeter::new(baseline_from_env())))
+}
+
+/// A baseline setting as a finite, positive number.
+pub fn parse_baseline(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number > 0.0)
 }
 
 /// Parse `MemTotal - MemAvailable` from a `/proc/meminfo` body, in bytes. The
@@ -140,7 +151,8 @@ pub fn parse_meminfo_used_bytes(contents: &str) -> Option<u64> {
 }
 
 /// Parse the busy CPU time of the aggregate `cpu` line of `/proc/stat`, in
-/// microseconds. Busy is everything but idle and iowait.
+/// microseconds. Busy is user, nice, system, irq and softirq. Steal is time the
+/// hypervisor withheld, and guest time is already inside user and nice.
 pub fn parse_proc_stat_busy_usec(contents: &str) -> Option<u64> {
     let line = contents.lines().find(|line| line.starts_with("cpu "))?;
     let ticks: Vec<u64> = line
@@ -148,13 +160,26 @@ pub fn parse_proc_stat_busy_usec(contents: &str) -> Option<u64> {
         .skip(1)
         .filter_map(|value| value.parse::<u64>().ok())
         .collect();
-    let total: u64 = ticks.iter().sum();
-    let idle = ticks.get(3).copied().unwrap_or(0) + ticks.get(4).copied().unwrap_or(0);
+    let busy: u64 = [0, 1, 2, 5, 6]
+        .iter()
+        .map(|index| ticks.get(*index).copied().unwrap_or(0))
+        .sum();
     // SAFETY: sysconf takes no pointers; it returns -1 for an unknown name.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     let hz = if hz > 0 { hz as u64 } else { 100 };
 
-    Some(total.saturating_sub(idle) * 1_000_000 / hz)
+    Some(busy * 1_000_000 / hz)
+}
+
+// Record one sample now. The sampler and `/exec` share the meter, so they share
+// one previous reading and never bill an interval twice.
+fn sample_now() {
+    let Some(sample) = read_sample() else {
+        return;
+    };
+    if let Ok(mut meter) = meter().lock() {
+        meter.record(Instant::now(), sample);
+    }
 }
 
 // The whole VM's CPU and memory. `/proc` covers every process in the guest, the
@@ -185,21 +210,27 @@ mod tests {
         }
     }
 
+    fn after(start: Instant, seconds: u64) -> Instant {
+        start + Duration::from_secs(seconds)
+    }
+
     #[test]
     fn bills_nothing_within_the_baseline() {
+        let start = Instant::now();
         let mut meter = BurstMeter::new(BASELINE);
-        meter.record(Duration::from_secs(1), sample(0.0, 1.0));
-        meter.record(Duration::from_secs(1), sample(0.8, 1.5));
+        meter.record(start, sample(0.0, 1.0));
+        meter.record(after(start, 1), sample(0.8, 1.5));
 
         assert_eq!(meter.totals(), BurstTotals::default());
     }
 
     #[test]
     fn bills_cpu_and_memory_above_the_baseline() {
+        let start = Instant::now();
         let mut meter = BurstMeter::new(BASELINE);
-        meter.record(Duration::from_secs(1), sample(0.0, 2.0));
+        meter.record(start, sample(0.0, 2.0));
         // Three vCPUs busy for a second at 3 GiB: 2 extra vCPU-s, 1 extra GiB-s.
-        meter.record(Duration::from_secs(1), sample(3.0, 3.0));
+        meter.record(after(start, 1), sample(3.0, 3.0));
 
         assert!((meter.totals().vcpu_seconds - 2.0).abs() < 1e-9);
         assert!((meter.totals().gb_seconds - 1.0).abs() < 1e-9);
@@ -207,11 +238,20 @@ mod tests {
 
     #[test]
     fn counts_a_suspend_gap_as_one_interval() {
+        let start = Instant::now();
         let mut meter = BurstMeter::new(BASELINE);
-        meter.record(Duration::from_secs(1), sample(0.0, 4.0));
-        meter.record(Duration::from_secs(3600), sample(0.0, 4.0));
+        meter.record(start, sample(0.0, 4.0));
+        meter.record(after(start, 3600), sample(0.0, 4.0));
 
-        assert!((meter.totals().gb_seconds - 2.0 * 5.0 - 2.0).abs() < 1e-9);
+        assert!((meter.totals().gb_seconds - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_baselines_that_are_not_finite_and_positive() {
+        assert_eq!(parse_baseline("2048"), Some(2048.0));
+        for value in ["-1", "0", "NaN", "inf", "two"] {
+            assert_eq!(parse_baseline(value), None, "{value}");
+        }
     }
 
     #[test]
@@ -223,11 +263,11 @@ mod tests {
 
     #[test]
     fn parses_busy_time_from_proc_stat() {
-        // user nice system idle iowait irq softirq steal
-        let body = "cpu  100 0 50 1000 10 0 0 0 0 0\ncpu0 100 0 50 1000 10 0 0 0 0 0\n";
+        // user nice system idle iowait irq softirq steal guest guest_nice
+        let body = "cpu  100 0 50 1000 10 5 5 70 40 0\ncpu0 100 0 50 1000 10 5 5 70 40 0\n";
         // SAFETY: as in parse_proc_stat_busy_usec.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
 
-        assert_eq!(parse_proc_stat_busy_usec(body), Some(150 * 1_000_000 / hz));
+        assert_eq!(parse_proc_stat_busy_usec(body), Some(160 * 1_000_000 / hz));
     }
 }
