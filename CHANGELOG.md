@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/exec` returns `burst`: the VM's vCPU-seconds and GiB-seconds above its
+  baseline since boot, so the harness can bill burst the way Lambda does.
 - The image declares a `HEALTHCHECK` against `/healthz`, so `docker ps` shows
   whether a locally run container is serving. Lambda still uses the `/ready` hook.
 - Optional `browser` build target: the runtime image plus Playwright's Chrome

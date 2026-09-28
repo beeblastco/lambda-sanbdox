@@ -11,6 +11,7 @@
 //!     Files persist across calls via the S3 mount the `/run` hook established.
 //!   - Ephemeral: no `namespace` → fresh /tmp/agent-workspace/<uuid>, cleaned up after.
 
+pub mod burst;
 pub mod mount;
 
 use anyhow::{anyhow, Context};
@@ -94,6 +95,11 @@ pub struct ExecResponse {
     /// (validation errors, timeouts) so the caller simply skips the CPU sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_usec: Option<u64>,
+
+    /// This VM's usage above its baseline since boot, filled in by the server so
+    /// the harness can bill burst. See [`burst`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<burst::BurstTotals>,
 }
 
 fn default_runtime() -> String {
@@ -168,6 +174,7 @@ fn error_response(
         workspace,
         truncated: false,
         cpu_usec: None,
+        burst: None,
     }
 }
 
@@ -338,6 +345,7 @@ async fn execute_request(
             workspace: workspace.display().to_string(),
             truncated: stdout_cut || stderr_cut,
             cpu_usec: None,
+            burst: None,
         });
     };
 
@@ -352,6 +360,7 @@ async fn execute_request(
         workspace: workspace.display().to_string(),
         truncated: stdout_cut || stderr_cut,
         cpu_usec: Some(run.cpu_usec),
+        burst: None,
     })
 }
 
