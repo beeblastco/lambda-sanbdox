@@ -236,7 +236,7 @@ via `MICROVM_IMAGE_IDENTIFIER`.
 | `workspace` | string | Path to the workspace directory used for this run |
 | `truncated` | boolean | `true` if the returned stdout or stderr was cut to 256 KB. Cut text ends in `...[truncated]`, so check this before decoding output. |
 | `cpu_usec` | integer | CPU time (user + system, incl. descendants) charged to the run, in microseconds. Omitted on validation errors and timeouts. |
-| `burst` | object | This VM's usage above its baseline since boot: `vcpu_seconds` and `gb_seconds` (GiB). Sampled once a second from `/proc/stat` and `/proc/meminfo`, so background processes count. Survives suspend and resume. Baseline from `SANDBOX_BASELINE_VCPU` and `SANDBOX_BASELINE_MEMORY_MB`, default 1 vCPU / 2048 MB. |
+| `burst` | object | This VM's usage above its baseline since boot: cumulative `vcpu_seconds` (vCPU-seconds) and `gb_seconds` (GiB-seconds). Sampled once a second and at the end of each exec, from `/proc/stat` and `/proc/meminfo`, so background processes count. Survives suspend and resume. Baseline from `SANDBOX_BASELINE_VCPU` and `SANDBOX_BASELINE_MEMORY_MB`, default 1 vCPU / 2048 MB. |
 
 ---
 
