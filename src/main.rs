@@ -19,6 +19,7 @@ use axum::{
     Json, Router,
 };
 use lambda_microvm_agent_sandbox::{
+    burst,
     mount::{self, MountCredentials, Workspace, CREDENTIALS_DIR, CREDENTIALS_PATH},
     run_exec, ExecRequest, ExecResponse, MAX_REQUEST_BYTES,
 };
@@ -48,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         mount_point: Arc::new(Mutex::new(None)),
         workspace: Arc::new(Mutex::new(None)),
     };
+    burst::spawn_sampler();
 
     let exec_app = Router::new()
         .route("/", get(health))
@@ -99,7 +101,9 @@ async fn exec_handler(State(state): State<AppState>, body: String) -> Json<ExecR
         Err(e) => return Json(invalid_request(format!("invalid request json: {e}"))),
     };
     let _guard = state.exec_lock.lock().await;
-    Json(run_exec(req).await)
+    let mut response = run_exec(req).await;
+    response.burst = Some(burst::totals());
+    Json(response)
 }
 
 fn invalid_request(stderr: String) -> ExecResponse {
@@ -114,6 +118,7 @@ fn invalid_request(stderr: String) -> ExecResponse {
         workspace: String::new(),
         truncated: false,
         cpu_usec: None,
+        burst: Some(burst::totals()),
     }
 }
 
