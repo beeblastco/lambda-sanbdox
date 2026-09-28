@@ -10,12 +10,13 @@
 //! snapshot and start again at zero only on a fresh VM.
 
 use serde::Serialize;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
-// A longer gap between samples is a suspend: the VM was frozen, so the gap counts
-// as one sample interval rather than billing memory for the whole of it.
+// A longer gap between samples may be a suspend: the VM was frozen, so memory is
+// billed for one sample interval rather than the whole gap. CPU keeps the real
+// gap, since a frozen VM used none and a late sampler under load used it all.
 const MAX_SAMPLE_GAP: Duration = Duration::from_secs(5);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -31,14 +32,18 @@ pub struct BurstTotals {
 /// The baseline the excess is measured from.
 #[derive(Debug, Clone, Copy)]
 pub struct Baseline {
+    /// vCPUs included in the baseline.
     pub vcpu: f64,
+    /// Memory included in the baseline, in bytes.
     pub memory_bytes: f64,
 }
 
 /// One guest reading: cumulative CPU time and memory in use right now.
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
+    /// Busy CPU time since boot, summed over every vCPU, in microseconds.
     pub cpu_usec: u64,
+    /// Memory in use now, without reclaimable page cache, in bytes.
     pub memory_used_bytes: u64,
 }
 
@@ -48,14 +53,20 @@ pub struct Sample {
 pub struct BurstMeter {
     baseline: Baseline,
     last: Option<(Instant, u64)>,
+    // CPU excess not billed yet: negative when recent intervals ran under the
+    // baseline, floored at one sample interval's capacity, so clock-tick jitter
+    // and a short exec interval cancel out instead of only rounding up.
+    cpu_carry: f64,
     totals: BurstTotals,
 }
 
 impl BurstMeter {
+    /// A meter with zero totals. The first recorded sample only sets the start.
     pub fn new(baseline: Baseline) -> Self {
         Self {
             baseline,
             last: None,
+            cpu_carry: 0.0,
             totals: BurstTotals::default(),
         }
     }
@@ -68,17 +79,25 @@ impl BurstMeter {
         let Some((last_at, last_cpu_usec)) = self.last.replace((at, sample.cpu_usec)) else {
             return;
         };
-        let mut elapsed = at.saturating_duration_since(last_at);
-        if elapsed > MAX_SAMPLE_GAP {
-            elapsed = SAMPLE_INTERVAL;
-        }
-        let seconds = elapsed.as_secs_f64();
+        let elapsed = at.saturating_duration_since(last_at);
         let used = sample.cpu_usec.saturating_sub(last_cpu_usec) as f64 / 1_000_000.0;
-        self.totals.vcpu_seconds += (used - seconds * self.baseline.vcpu).max(0.0);
+        let floor = -SAMPLE_INTERVAL.as_secs_f64() * self.baseline.vcpu;
+        self.cpu_carry =
+            (self.cpu_carry + used - elapsed.as_secs_f64() * self.baseline.vcpu).max(floor);
+        if self.cpu_carry > 0.0 {
+            self.totals.vcpu_seconds += self.cpu_carry;
+            self.cpu_carry = 0.0;
+        }
+        let memory_seconds = if elapsed > MAX_SAMPLE_GAP {
+            SAMPLE_INTERVAL
+        } else {
+            elapsed
+        };
         let extra_bytes = sample.memory_used_bytes as f64 - self.baseline.memory_bytes;
-        self.totals.gb_seconds += (extra_bytes / GIB).max(0.0) * seconds;
+        self.totals.gb_seconds += (extra_bytes / GIB).max(0.0) * memory_seconds.as_secs_f64();
     }
 
+    /// The totals so far.
     pub fn totals(&self) -> BurstTotals {
         self.totals
     }
@@ -89,16 +108,16 @@ impl BurstMeter {
 pub fn totals() -> BurstTotals {
     sample_now();
 
-    meter()
-        .lock()
-        .map(|meter| meter.totals())
-        .unwrap_or_default()
+    lock_meter().totals()
 }
 
 /// Sample the guest every second for the life of the process. Called once from main.
 pub fn spawn_sampler() {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
+        // After a clock jump, one sample covers the gap instead of a burst of
+        // back-to-back ticks.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             sample_now();
@@ -123,9 +142,14 @@ fn env_number(name: &str) -> Option<f64> {
     parse_baseline(&std::env::var(name).ok()?)
 }
 
-fn meter() -> &'static Mutex<BurstMeter> {
+// The process-wide meter. A poisoned lock still holds valid totals, so it is
+// used rather than reporting zero, which would read as the counters resetting.
+fn lock_meter() -> MutexGuard<'static, BurstMeter> {
     static METER: OnceLock<Mutex<BurstMeter>> = OnceLock::new();
-    METER.get_or_init(|| Mutex::new(BurstMeter::new(baseline_from_env())))
+    METER
+        .get_or_init(|| Mutex::new(BurstMeter::new(baseline_from_env())))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A baseline setting as a finite, positive number.
@@ -171,13 +195,12 @@ pub fn parse_proc_stat_busy_usec(contents: &str) -> Option<u64> {
     Some(busy * 1_000_000 / hz)
 }
 
-// Record one sample now. The sampler and `/exec` share the meter, so they share
-// one previous reading and never bill an interval twice.
+// Record one sample now. The sampler and `/exec` share the meter and read
+// `/proc` under its lock, so their readings are stored in the order taken and
+// no interval is billed twice.
 fn sample_now() {
-    let Some(sample) = read_sample() else {
-        return;
-    };
-    if let Ok(mut meter) = meter().lock() {
+    let mut meter = lock_meter();
+    if let Some(sample) = read_sample() {
         meter.record(Instant::now(), sample);
     }
 }
@@ -244,6 +267,28 @@ mod tests {
         meter.record(after(start, 3600), sample(0.0, 4.0));
 
         assert!((meter.totals().gb_seconds - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bills_a_late_samplers_cpu_against_the_whole_gap() {
+        let start = Instant::now();
+        let mut meter = BurstMeter::new(BASELINE);
+        meter.record(start, sample(0.0, 1.0));
+        // One vCPU busy through a 10 s gap is exactly the baseline.
+        meter.record(after(start, 10), sample(10.0, 1.0));
+
+        assert_eq!(meter.totals(), BurstTotals::default());
+    }
+
+    #[test]
+    fn cancels_tick_jitter_around_the_baseline() {
+        let start = Instant::now();
+        let mut meter = BurstMeter::new(BASELINE);
+        meter.record(start, sample(0.0, 1.0));
+        meter.record(after(start, 1), sample(0.99, 1.0));
+        meter.record(after(start, 2), sample(2.0, 1.0));
+
+        assert!(meter.totals().vcpu_seconds.abs() < 1e-9);
     }
 
     #[test]
