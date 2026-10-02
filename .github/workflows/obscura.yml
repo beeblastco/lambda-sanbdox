@@ -22,6 +22,11 @@ on:
 permissions:
   contents: read
 
+# One build per version at a time, so two pushes cannot both see no release and race to create it.
+concurrency:
+  group: obscura-binary
+  cancel-in-progress: false
+
 env:
   OBSCURA_VERSION: "0.2.3"
   OBSCURA_COMMIT: "1a3169da276d7720732c7b20535474942917fb83"
