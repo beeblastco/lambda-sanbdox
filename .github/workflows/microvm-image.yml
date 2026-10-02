@@ -36,12 +36,13 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # One image per variant. AWS builds the Dockerfile's last stage, so the browser
-    # variant appends `FROM browser` before zipping and publishes under its own name.
+    # One image per variant. AWS builds the Dockerfile's last stage, so a non-base
+    # variant appends `FROM <variant>` before zipping and publishes under its own name
+    # (`<image>-browser`, `<image>-obscura`).
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, browser]
+        variant: [base, browser, obscura]
     steps:
       - uses: actions/checkout@v5
 

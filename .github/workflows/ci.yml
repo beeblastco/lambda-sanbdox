@@ -150,6 +150,33 @@ jobs:
             -d '{"runtime":"bash","code":"chromium --version","timeout_ms":60000}' | grep '"ok":true'
           docker rm -f sandbox-browser-smoke
 
+      # The obscura stage is opt-in (`--target obscura`) as well.
+      - name: Build arm64 obscura image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: obscura
+          push: false
+          load: true
+          tags: lambda-microvm-agent-sandbox:obscura
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: ${{ env.DOCKER_PLATFORM }}
+          provenance: false
+          sbom: false
+
+      - name: Smoke test obscura image
+        run: |
+          docker run -d --name sandbox-obscura-smoke -p 8082:8080 lambda-microvm-agent-sandbox:obscura
+          sleep 4
+          # Render a local fixture through /exec. Obscura refuses private addresses unless told otherwise.
+          CODE='mkdir -p /tmp/fixture && echo "<title>fixture</title><h1>obscura smoke</h1>" > /tmp/fixture/index.html && (cd /tmp/fixture && python3 -m http.server 8000 >/dev/null 2>&1 &) && sleep 1 && obscura fetch http://127.0.0.1:8000/ --allow-private-network --dump text --quiet'
+          curl -fsS -X POST "http://localhost:8082/exec" \
+            -H 'content-type: application/json' \
+            -d "$(jq -n --arg code "$CODE" '{runtime:"bash",code:$code,timeout_ms:120000}')" | tee /tmp/obscura-smoke.json
+          jq -e '.ok == true and (.stdout | contains("obscura smoke"))' /tmp/obscura-smoke.json
+          docker rm -f sandbox-obscura-smoke
+
   # ─── Arm64 build & push to every ECR_REGIONS region + GHCR (main only) ───
   build-platform:
     runs-on: ubuntu-latest
