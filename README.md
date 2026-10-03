@@ -125,6 +125,7 @@ curl -s -X POST localhost:8080/mcp -H 'content-type: application/json' -d '{
 - A process that exited, or a changed `command`, is started again on the next message.
 - The response is the server's JSON-RPC response with HTTP 200. A notification gets HTTP 202. A failure to start or reach the server is a JSON-RPC `error` with HTTP 200, because the proxy's own 502/503 mean the VM is still restoring.
 - Optional `env` sets the server's environment and `timeout_ms` (default 60000, max 600000) bounds the wait for one answer.
+- Every answer carries the VM's burst totals as JSON in the `x-sandbox-burst` header, the same numbers `/exec` returns in `burst`, so MCP-only use is billed.
 
 ---
 

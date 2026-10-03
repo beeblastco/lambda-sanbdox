@@ -115,23 +115,29 @@ async fn exec_handler(State(state): State<AppState>, body: String) -> Json<ExecR
 
 /// `POST /mcp` — relay one JSON-RPC message to the named stdio MCP server. Host
 /// failures come back as a JSON-RPC error with HTTP 200: the proxy's own 502/503
-/// mean "VM still restoring" to the harness, which retries on them.
-async fn mcp_handler(State(state): State<AppState>, body: String) -> (StatusCode, Json<Value>) {
-    let request: McpRequest = match serde_json::from_str(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::OK,
-                Json(rpc_error(None, format!("invalid request json: {e}"))),
-            )
+/// mean "VM still restoring" to the harness. Every answer carries the VM's burst
+/// totals in `x-sandbox-burst`, as `/exec` does in its body, so MCP-only use bills.
+async fn mcp_handler(
+    State(state): State<AppState>,
+    body: String,
+) -> (StatusCode, [(&'static str, String); 1], Json<Value>) {
+    let (status, reply) = match serde_json::from_str::<McpRequest>(&body) {
+        Err(e) => (
+            StatusCode::OK,
+            rpc_error(None, format!("invalid request json: {e}")),
+        ),
+        Ok(request) => {
+            let id = request.message.get("id").cloned();
+            match state.mcp.handle(request).await {
+                Ok(Some(response)) => (StatusCode::OK, response),
+                Ok(None) => (StatusCode::ACCEPTED, Value::Null),
+                Err(e) => (StatusCode::OK, rpc_error(id, format!("{e:#}"))),
+            }
         }
     };
-    let id = request.message.get("id").cloned();
-    match state.mcp.handle(request).await {
-        Ok(Some(response)) => (StatusCode::OK, Json(response)),
-        Ok(None) => (StatusCode::ACCEPTED, Json(Value::Null)),
-        Err(e) => (StatusCode::OK, Json(rpc_error(id, format!("{e:#}")))),
-    }
+    let burst = serde_json::to_string(&burst::totals()).unwrap_or_default();
+
+    (status, [("x-sandbox-burst", burst)], Json(reply))
 }
 
 fn rpc_error(id: Option<Value>, message: String) -> Value {
