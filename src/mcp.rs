@@ -4,14 +4,14 @@
 //! message. The first message for a name spawns the command and runs the MCP
 //! `initialize` handshake; later ones reuse the same process, so a stateful
 //! server (a browser session, say) keeps its state for as long as the VM lives.
-//! A server whose process exited, or whose command changed, is started again.
-//! Exec already runs arbitrary code as root here, so starting a command is no
-//! new privilege; the MicroVM stays the isolation boundary.
+//! A server whose process exited, or whose command or environment changed, is
+//! started again. Exec already runs arbitrary code as root here, so starting a
+//! command is no new privilege; the MicroVM stays the isolation boundary.
 
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 
 use anyhow::{anyhow, bail, Context};
 use serde::Deserialize;
@@ -26,6 +26,12 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Distinct server names one VM keeps running; each is a live process.
+const MAX_SERVERS: usize = 16;
+
+type Pending = Arc<SyncMutex<HashMap<u64, oneshot::Sender<Value>>>>;
+/// One server name's running process, locked while it starts.
+type Slot = Arc<Mutex<Option<Arc<McpServer>>>>;
 
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {
@@ -41,10 +47,11 @@ pub struct McpRequest {
     pub timeout_ms: u64,
 }
 
-/// Every stdio server this VM is running, by name.
+/// Every stdio server this VM is running. Each name has its own slot, so a server
+/// that is slow to start holds up only the calls for that name.
 #[derive(Default)]
 pub struct McpHost {
-    servers: Mutex<HashMap<String, Arc<McpServer>>>,
+    slots: Mutex<HashMap<String, Slot>>,
 }
 
 impl McpHost {
@@ -64,15 +71,27 @@ impl McpHost {
     }
 
     async fn server(&self, request: &McpRequest) -> anyhow::Result<Arc<McpServer>> {
-        let mut servers = self.servers.lock().await;
-        if let Some(existing) = servers.get(&request.server) {
-            if existing.alive.load(Ordering::SeqCst) && existing.command == request.command {
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            if !slots.contains_key(&request.server) && slots.len() >= MAX_SERVERS {
+                bail!("this VM already runs {MAX_SERVERS} MCP servers");
+            }
+            slots.entry(request.server.clone()).or_default().clone()
+        };
+        let mut slot = slot.lock().await;
+        if let Some(existing) = slot.as_ref() {
+            if existing.alive.load(Ordering::SeqCst)
+                && existing.command == request.command
+                && existing.env == request.env
+            {
                 return Ok(existing.clone());
             }
+            // Stop the old process before its replacement starts: it may hold
+            // something the new one needs, and in-flight calls keep it referenced.
+            existing.child.lock().await.start_kill().ok();
         }
         let server = McpServer::start(request).await?;
-        // Replacing the entry drops the old process, which kill_on_drop then stops.
-        servers.insert(request.server.clone(), server.clone());
+        *slot = Some(server.clone());
 
         Ok(server)
     }
@@ -80,11 +99,12 @@ impl McpHost {
 
 struct McpServer {
     command: Vec<String>,
-    stdin: Mutex<ChildStdin>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    env: HashMap<String, String>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Pending,
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
-    _child: Child,
+    child: Mutex<Child>,
 }
 
 impl McpServer {
@@ -100,18 +120,26 @@ impl McpServer {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("start MCP server {:?}", request.command))?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        let stdin = Arc::new(Mutex::new(
+            child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?,
+        ));
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> = Arc::default();
+        let pending: Pending = Arc::default();
         let alive = Arc::new(AtomicBool::new(true));
-        tokio::spawn(read_responses(stdout, pending.clone(), alive.clone()));
+        tokio::spawn(read_messages(
+            stdout,
+            stdin.clone(),
+            pending.clone(),
+            alive.clone(),
+        ));
         let server = Arc::new(McpServer {
             command: request.command.clone(),
-            stdin: Mutex::new(stdin),
+            env: request.env.clone(),
+            stdin,
             pending,
             next_id: AtomicU64::new(1),
             alive,
-            _child: child,
+            child: Mutex::new(child),
         });
         server.initialize().await?;
 
@@ -146,52 +174,71 @@ impl McpServer {
     }
 
     /// Send one message under a host-assigned id, so concurrent callers can never
-    /// collide, then hand the caller back its own id on the response.
+    /// collide, then hand the caller back its own id on the response. One deadline
+    /// covers the write and the wait, so a server that stops reading cannot hang it.
     async fn forward(&self, mut message: Value, wait: Duration) -> anyhow::Result<Option<Value>> {
         let original_id = message.get("id").cloned();
-        let receiver = match original_id {
-            None => None,
-            Some(_) => {
-                let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-                message["id"] = json!(id);
-                let (sender, receiver) = oneshot::channel();
-                self.pending.lock().await.insert(id, sender);
-                Some((id, receiver))
+        let waiter = original_id.as_ref().map(|_| {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            message["id"] = json!(id);
+            let (sender, receiver) = oneshot::channel();
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .insert(id, sender);
+            (
+                PendingGuard {
+                    pending: self.pending.clone(),
+                    id,
+                },
+                receiver,
+            )
+        });
+        let exchange = async {
+            write_line(&self.stdin, &message).await?;
+            let Some((_guard, receiver)) = waiter else {
+                return Ok(None);
+            };
+            match receiver.await {
+                Ok(response) => Ok(Some(response)),
+                Err(_) => bail!("MCP server exited before answering"),
             }
         };
-        let mut line = serde_json::to_vec(&message)?;
-        line.push(b'\n');
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin
-                .write_all(&line)
-                .await
-                .context("write to MCP server")?;
-            stdin.flush().await.context("write to MCP server")?;
+        let mut response = match timeout(wait, exchange).await {
+            Ok(result) => result?,
+            Err(_) => bail!("MCP server did not answer within {} ms", wait.as_millis()),
+        };
+        if let Some(response) = response.as_mut() {
+            response["id"] = original_id.unwrap_or(Value::Null);
         }
-        let Some((id, receiver)) = receiver else {
-            return Ok(None);
-        };
-        let mut response = match timeout(wait, receiver).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) => bail!("MCP server exited before answering"),
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                bail!("MCP server did not answer within {} ms", wait.as_millis());
-            }
-        };
-        response["id"] = original_id.unwrap_or(Value::Null);
 
-        Ok(Some(response))
+        Ok(response)
     }
 }
 
-/// Route each response line to the caller waiting on its id. Server-initiated
-/// requests and notifications have no waiter and are dropped. On EOF the server is
-/// marked dead and every waiter is released, so the next call starts it again.
-async fn read_responses(
+/// Drops a call's pending entry however the call ends: answered, failed, timed
+/// out, or cancelled by a dropped request.
+struct PendingGuard {
+    pending: Pending,
+    id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
+/// Route each response line to the caller waiting on its id. A server's own
+/// request is answered here: `ping` with an empty result, anything else with
+/// method-not-found, since the host offers no client features. On EOF the server
+/// is marked dead and every waiter is released, so the next call starts it again.
+async fn read_messages(
     stdout: tokio::process::ChildStdout,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Pending,
     alive: Arc<AtomicBool>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
@@ -199,17 +246,44 @@ async fn read_responses(
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if message.get("method").is_some() {
-            continue;
-        }
-        if let Some(id) = message.get("id").and_then(Value::as_u64) {
-            if let Some(sender) = pending.lock().await.remove(&id) {
-                let _ = sender.send(message);
+        let id = message.get("id").cloned();
+        match (message.get("method").and_then(Value::as_str), id) {
+            (Some(method), Some(id)) => {
+                let reply = if method == "ping" {
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                } else {
+                    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not found" } })
+                };
+                let _ = write_line(&stdin, &reply).await;
             }
+            (None, Some(id)) => {
+                let waiter = id
+                    .as_u64()
+                    .and_then(|id| pending.lock().ok().and_then(|mut p| p.remove(&id)));
+                if let Some(sender) = waiter {
+                    let _ = sender.send(message);
+                }
+            }
+            _ => {}
         }
     }
     alive.store(false, Ordering::SeqCst);
-    pending.lock().await.clear();
+    if let Ok(mut pending) = pending.lock() {
+        pending.clear();
+    }
+}
+
+async fn write_line(stdin: &Mutex<ChildStdin>, message: &Value) -> anyhow::Result<()> {
+    let mut line = serde_json::to_vec(message)?;
+    line.push(b'\n');
+    let mut stdin = stdin.lock().await;
+    stdin
+        .write_all(&line)
+        .await
+        .context("write to MCP server")?;
+    stdin.flush().await.context("write to MCP server")?;
+
+    Ok(())
 }
 
 fn default_timeout_ms() -> u64 {
@@ -220,20 +294,23 @@ fn default_timeout_ms() -> u64 {
 mod tests {
     use super::*;
 
-    // A stdio MCP server in a few lines of Python: answers initialize, counts
-    // tools/call so a reused process is visible, and ignores notifications.
+    // A stdio MCP server in a few lines of Python: answers initialize, pings the
+    // host before each tool reply, counts tools/call so a reused process is
+    // visible, and ignores notifications.
     const FAKE_SERVER: &str = r#"
 import json, sys
 calls = 0
 for line in sys.stdin:
     msg = json.loads(line)
-    if "id" not in msg:
+    if "method" not in msg or "id" not in msg:
         continue
     if msg["method"] == "initialize":
         result = {"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {}, "serverInfo": {"name": "fake", "version": "1"}}
     else:
+        print(json.dumps({"jsonrpc": "2.0", "id": "ping-1", "method": "ping"}), flush=True)
+        pong = json.loads(sys.stdin.readline())
         calls += 1
-        result = {"content": [{"type": "text", "text": f"call {calls}"}]}
+        result = {"content": [{"type": "text", "text": f"call {calls} pong {pong.get('result') == {}}"}]}
     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
 "#;
 
@@ -248,7 +325,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn keeps_one_process_per_server_and_restores_the_caller_id() {
+    async fn keeps_one_process_per_server_answers_pings_and_restores_the_caller_id() {
         let host = McpHost::default();
         let first = host
             .handle(call("fake", json!("a")))
@@ -258,9 +335,29 @@ for line in sys.stdin:
         let second = host.handle(call("fake", json!(7))).await.unwrap().unwrap();
 
         assert_eq!(first["id"], json!("a"));
-        assert_eq!(first["result"]["content"][0]["text"], json!("call 1"));
+        assert_eq!(
+            first["result"]["content"][0]["text"],
+            json!("call 1 pong True")
+        );
         assert_eq!(second["id"], json!(7));
-        assert_eq!(second["result"]["content"][0]["text"], json!("call 2"));
+        assert_eq!(
+            second["result"]["content"][0]["text"],
+            json!("call 2 pong True")
+        );
+    }
+
+    #[tokio::test]
+    async fn restarts_a_server_whose_environment_changed() {
+        let host = McpHost::default();
+        host.handle(call("fake", json!(1))).await.unwrap();
+        let mut changed = call("fake", json!(2));
+        changed.env.insert("MODE".into(), "other".into());
+        let response = host.handle(changed).await.unwrap().unwrap();
+
+        assert_eq!(
+            response["result"]["content"][0]["text"],
+            json!("call 1 pong True")
+        );
     }
 
     #[tokio::test]
