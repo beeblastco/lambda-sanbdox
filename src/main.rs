@@ -4,6 +4,7 @@
 //! bound to 0.0.0.0:
 //!   - **:8080** — the exec API the proxy routes external 443 to. `POST /exec`
 //!     takes the sandbox request JSON and returns a structured exec response.
+//!     `POST /mcp` relays one JSON-RPC message to a stdio MCP server it keeps running.
 //!   - **:9000** — the lifecycle hooks Lambda calls (`/run` mounts the workspace
 //!     S3 prefix; `/suspend`/`/terminate` flush it). Configured via `--hooks` at
 //!     image-create time; both ports must be `EXPOSE`d in the Dockerfile.
@@ -20,9 +21,11 @@ use axum::{
 };
 use lambda_microvm_agent_sandbox::{
     burst,
+    mcp::{McpHost, McpRequest},
     mount::{self, MountCredentials, Workspace, CREDENTIALS_DIR, CREDENTIALS_PATH},
     run_exec, ExecRequest, ExecResponse, MAX_REQUEST_BYTES,
 };
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -40,6 +43,8 @@ struct AppState {
     // The workspace `/run` mounted, replayed by `/resume`: mountpoint-s3 does not
     // survive the suspend snapshot, so a restored VM has to mount again.
     workspace: Arc<Mutex<Option<Workspace>>>,
+    // Stdio MCP servers started by `/mcp`, alive for as long as the VM.
+    mcp: Arc<McpHost>,
 }
 
 #[tokio::main]
@@ -48,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         exec_lock: Arc::new(Mutex::new(())),
         mount_point: Arc::new(Mutex::new(None)),
         workspace: Arc::new(Mutex::new(None)),
+        mcp: Arc::new(McpHost::default()),
     };
     burst::spawn_sampler();
 
@@ -55,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(health))
         .route("/healthz", get(health))
         .route("/exec", post(exec_handler))
+        .route("/mcp", post(mcp_handler))
         .route(CREDENTIALS_PATH, post(put_credentials_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state.clone());
@@ -104,6 +111,41 @@ async fn exec_handler(State(state): State<AppState>, body: String) -> Json<ExecR
     let mut response = run_exec(req).await;
     response.burst = Some(burst::totals());
     Json(response)
+}
+
+/// `POST /mcp` — relay one JSON-RPC message to the named stdio MCP server. Host
+/// failures come back as a JSON-RPC error with HTTP 200: the proxy's own 502/503
+/// mean "VM still restoring" to the harness. Every answer carries the VM's burst
+/// totals in `x-sandbox-burst`, as `/exec` does in its body, so MCP-only use bills.
+async fn mcp_handler(
+    State(state): State<AppState>,
+    body: String,
+) -> (StatusCode, [(&'static str, String); 1], Json<Value>) {
+    let (status, reply) = match serde_json::from_str::<McpRequest>(&body) {
+        Err(e) => (
+            StatusCode::OK,
+            rpc_error(None, format!("invalid request json: {e}")),
+        ),
+        Ok(request) => {
+            let id = request.message.get("id").cloned();
+            match state.mcp.handle(request).await {
+                Ok(Some(response)) => (StatusCode::OK, response),
+                Ok(None) => (StatusCode::ACCEPTED, Value::Null),
+                Err(e) => (StatusCode::OK, rpc_error(id, format!("{e:#}"))),
+            }
+        }
+    };
+    let burst = serde_json::to_string(&burst::totals()).unwrap_or_default();
+
+    (status, [("x-sandbox-burst", burst)], Json(reply))
+}
+
+fn rpc_error(id: Option<Value>, message: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": { "code": -32000, "message": message },
+    })
 }
 
 fn invalid_request(stderr: String) -> ExecResponse {

@@ -12,6 +12,7 @@
 //!   - Ephemeral: no `namespace` → fresh /tmp/agent-workspace/<uuid>, cleaned up after.
 
 pub mod burst;
+pub mod mcp;
 pub mod mount;
 
 use anyhow::{anyhow, Context};
