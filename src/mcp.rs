@@ -263,9 +263,10 @@ impl Drop for PendingGuard {
 
 /// Route each response line to the caller waiting on its id. A server's own
 /// request is answered here: `ping` with an empty result, anything else with
-/// method-not-found, since the host offers no client features. A reply that finds
-/// the outbox full is dropped rather than stall the reader. On EOF the server is
-/// marked dead and every waiter is released, so the next call starts it again. A
+/// method-not-found, since the host offers no client features. A reply waits for
+/// room in the outbox on its own task, so it never stalls the reader. On EOF the
+/// server is marked dead and every waiter is released, so the next call starts it
+/// again. A
 /// line longer than a request may be ends the server the same way, rather than
 /// buffering a runaway server's output without bound.
 async fn read_messages(
@@ -300,7 +301,8 @@ async fn read_messages(
                     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not found" } })
                 };
                 if let Ok(line) = encode(&reply) {
-                    let _ = outbox.try_send(line);
+                    let outbox = outbox.clone();
+                    tokio::spawn(async move { outbox.send(line).await.ok() });
                 }
             }
             (None, Some(id)) => {
