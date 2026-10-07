@@ -135,8 +135,9 @@ jobs:
           push: false
           load: true
           tags: lambda-microvm-agent-sandbox:browser
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Each variant keeps its own cache scope, or the last build's export replaces it.
+          cache-from: type=gha,scope=browser
+          cache-to: type=gha,mode=max,scope=browser
           platforms: ${{ env.DOCKER_PLATFORM }}
           provenance: false
           sbom: false
@@ -159,8 +160,8 @@ jobs:
           push: false
           load: true
           tags: lambda-microvm-agent-sandbox:obscura
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=obscura
+          cache-to: type=gha,mode=max,scope=obscura
           platforms: ${{ env.DOCKER_PLATFORM }}
           provenance: false
           sbom: false

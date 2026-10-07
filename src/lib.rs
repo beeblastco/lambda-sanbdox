@@ -449,11 +449,16 @@ fn capped_text(bytes: &[u8], cap: usize) -> (String, bool) {
 /// group and survives, as broods's detached jobs intend.
 fn kill_process_group(child: &Child) {
     if let Some(pid) = child.id() {
-        // SAFETY: killpg only sends a signal. The child was spawned with
-        // process_group(0), so its pid is the group id.
-        unsafe {
-            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-        }
+        kill_group(pid);
+    }
+}
+
+/// SIGKILL the process group led by `pid`, a child spawned with `process_group(0)`.
+pub(crate) fn kill_group(pid: u32) {
+    // SAFETY: killpg only sends a signal. The child was spawned with
+    // process_group(0), so its pid is the group id.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
     }
 }
 

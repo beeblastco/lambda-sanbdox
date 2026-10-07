@@ -110,6 +110,7 @@ jobs:
           gh release create "obscura-v${OBSCURA_VERSION}" "$asset" "$asset.sha256" \
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
+            --latest=false \
             --title "Obscura ${OBSCURA_VERSION} for the MicroVM base (AL2023, arm64)" \
             --notes "Obscura v${OBSCURA_VERSION} (commit ${OBSCURA_COMMIT}) built on amazonlinux:2023 with the release-dist profile and the render feature. sha256: ${sha}"
           echo "OBSCURA_SHA256=${sha}" >> "$GITHUB_STEP_SUMMARY"
