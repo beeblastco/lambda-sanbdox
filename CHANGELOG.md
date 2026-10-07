@@ -37,10 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/mcp` no longer wedges a server after a timed-out call. The cancelled write left
   half a line in the server's input, so every later message was glued onto it and
   never answered. One writer task now writes each line whole.
-- `/mcp` stops a server that writes a line over 16 MB instead of buffering it
-  without bound, kills a replaced server's whole process group, frees the slots of
-  servers that never started or have exited, and answers a notification with a
-  bodyless 202.
+- `/mcp` stops a server, its whole process group with it, when its process exits
+  (even if a child keeps stdout open), when it writes a line over 16 MB, or when it
+  is replaced. A request whose caller timed out is never sent, the slots of
+  stopped servers are freed, and a notification gets a bodyless 202.
 - The benchmark report's per-category headings read `### Bash Runtime` instead
   of `### ### Bash Runtime`.
 - A run that backgrounds a process (`cmd &`) now returns when its script exits.

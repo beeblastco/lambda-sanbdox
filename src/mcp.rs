@@ -17,11 +17,11 @@ use anyhow::{anyhow, bail, Context};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 
-use crate::{kill_process_group, MAX_REQUEST_BYTES};
+use crate::{kill_group, MAX_REQUEST_BYTES};
 
 /// The MCP revision the host offers in `initialize`; the server answers with its own.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -30,12 +30,14 @@ const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 /// Distinct server names one VM keeps running; each is a live process.
 const MAX_SERVERS: usize = 16;
-/// Lines queued for one server's stdin before a sender waits.
-const OUTBOX_LINES: usize = 32;
+/// Messages queued for one server's stdin before a sender waits. Each can be as
+/// large as a request, so the queue stays short.
+const OUTBOX_LINES: usize = 4;
 
-type Pending = Arc<SyncMutex<HashMap<u64, oneshot::Sender<Value>>>>;
 /// One server name's running process, locked while it starts.
 type Slot = Arc<Mutex<Option<Arc<McpServer>>>>;
+/// A line for the server's stdin, with the host id of the call that waits on it.
+type Outgoing = (Option<u64>, Vec<u8>);
 
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {
@@ -91,9 +93,7 @@ impl McpHost {
                 slots.retain(|_, slot| {
                     Arc::strong_count(slot) > 1
                         || slot.try_lock().map_or(true, |server| {
-                            server
-                                .as_ref()
-                                .is_some_and(|server| server.alive.load(Ordering::SeqCst))
+                            server.as_ref().is_some_and(|server| server.link.is_alive())
                         })
                 });
                 if slots.len() >= MAX_SERVERS {
@@ -103,17 +103,19 @@ impl McpHost {
             slots.entry(request.server.clone()).or_default().clone()
         };
         let mut slot = slot.lock().await;
-        if let Some(existing) = slot.as_ref() {
-            if existing.alive.load(Ordering::SeqCst)
+        if let Some(existing) = slot.take() {
+            if existing.link.is_alive()
                 && existing.command == request.command
                 && existing.env == request.env
             {
-                return Ok(existing.clone());
+                *slot = Some(existing.clone());
+
+                return Ok(existing);
             }
             // Stop the old process and its children before the replacement starts:
-            // they may hold something the new one needs, and in-flight calls keep
-            // the old server referenced.
-            kill_process_group(&*existing.child.lock().await);
+            // they may hold something the new one needs. The slot stays empty if the
+            // replacement fails, so no caller reuses the stopped server.
+            existing.link.stop();
         }
         let server = McpServer::start(request).await?;
         *slot = Some(server.clone());
@@ -125,11 +127,43 @@ impl McpHost {
 struct McpServer {
     command: Vec<String>,
     env: HashMap<String, String>,
-    outbox: mpsc::Sender<Vec<u8>>,
-    pending: Pending,
+    outbox: mpsc::Sender<Outgoing>,
+    link: Arc<Link>,
     next_id: AtomicU64,
-    alive: Arc<AtomicBool>,
-    child: Mutex<Child>,
+}
+
+/// What a server's reader, writer and exit watcher share. Whichever of them sees
+/// the server go first stops it for all.
+struct Link {
+    pending: SyncMutex<HashMap<u64, oneshot::Sender<Value>>>,
+    alive: AtomicBool,
+    pid: Option<u32>,
+}
+
+impl Link {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn is_waiting(&self, id: u64) -> bool {
+        self.pending
+            .lock()
+            .is_ok_and(|pending| pending.contains_key(&id))
+    }
+
+    /// Mark the server dead, release every waiter and kill its process group, so
+    /// nothing it started outlives it. Only the first call does anything.
+    fn stop(&self) {
+        if !self.alive.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.clear();
+        }
+        if let Some(pid) = self.pid {
+            kill_group(pid);
+        }
+    }
 }
 
 impl McpServer {
@@ -149,23 +183,26 @@ impl McpServer {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let (outbox, lines) = mpsc::channel(OUTBOX_LINES);
-        let pending: Pending = Arc::default();
-        let alive = Arc::new(AtomicBool::new(true));
-        tokio::spawn(write_lines(stdin, lines, alive.clone()));
-        tokio::spawn(read_messages(
-            stdout,
-            outbox.clone(),
-            pending.clone(),
-            alive.clone(),
-        ));
+        let link = Arc::new(Link {
+            pending: SyncMutex::default(),
+            alive: AtomicBool::new(true),
+            pid: child.id(),
+        });
+        tokio::spawn(write_lines(stdin, lines, link.clone()));
+        tokio::spawn(read_messages(stdout, outbox.clone(), link.clone()));
+        // A process can exit while a child it left keeps stdout open, so its exit,
+        // not EOF, is what marks it dead.
+        let watched = link.clone();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            watched.stop();
+        });
         let server = Arc::new(McpServer {
             command: request.command.clone(),
             env: request.env.clone(),
             outbox,
-            pending,
+            link,
             next_id: AtomicU64::new(1),
-            alive,
-            child: Mutex::new(child),
         });
         server.initialize().await?;
 
@@ -208,22 +245,24 @@ impl McpServer {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             message["id"] = json!(id);
             let (sender, receiver) = oneshot::channel();
-            self.pending
+            self.link
+                .pending
                 .lock()
                 .expect("pending lock")
                 .insert(id, sender);
             (
                 PendingGuard {
-                    pending: self.pending.clone(),
+                    link: self.link.clone(),
                     id,
                 },
                 receiver,
             )
         });
+        let host_id = waiter.as_ref().map(|(guard, _)| guard.id);
         let line = encode(&message)?;
         let exchange = async {
             self.outbox
-                .send(line)
+                .send((host_id, line))
                 .await
                 .map_err(|_| anyhow!("MCP server stopped reading its input"))?;
             let Some((_guard, receiver)) = waiter else {
@@ -249,13 +288,13 @@ impl McpServer {
 /// Drops a call's pending entry however the call ends: answered, failed, timed
 /// out, or cancelled by a dropped request.
 struct PendingGuard {
-    pending: Pending,
+    link: Arc<Link>,
     id: u64,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
+        if let Ok(mut pending) = self.link.pending.lock() {
             pending.remove(&self.id);
         }
     }
@@ -264,16 +303,13 @@ impl Drop for PendingGuard {
 /// Route each response line to the caller waiting on its id. A server's own
 /// request is answered here: `ping` with an empty result, anything else with
 /// method-not-found, since the host offers no client features. A reply waits for
-/// room in the outbox on its own task, so it never stalls the reader. On EOF the
-/// server is marked dead and every waiter is released, so the next call starts it
-/// again. A
-/// line longer than a request may be ends the server the same way, rather than
-/// buffering a runaway server's output without bound.
+/// room in the outbox on its own task, so it never stalls the reader. EOF stops
+/// the server, so the next call starts it again, and so does a line longer than a
+/// request may be, rather than buffering a runaway server's output without bound.
 async fn read_messages(
     stdout: tokio::process::ChildStdout,
-    outbox: mpsc::Sender<Vec<u8>>,
-    pending: Pending,
-    alive: Arc<AtomicBool>,
+    outbox: mpsc::Sender<Outgoing>,
+    link: Arc<Link>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -302,13 +338,16 @@ async fn read_messages(
                 };
                 if let Ok(line) = encode(&reply) {
                     let outbox = outbox.clone();
-                    tokio::spawn(async move { outbox.send(line).await.ok() });
+                    tokio::spawn(async move { outbox.send((None, line)).await.ok() });
                 }
             }
             (None, Some(id)) => {
-                let waiter = id
-                    .as_u64()
-                    .and_then(|id| pending.lock().ok().and_then(|mut p| p.remove(&id)));
+                let waiter = id.as_u64().and_then(|id| {
+                    link.pending
+                        .lock()
+                        .ok()
+                        .and_then(|mut pending| pending.remove(&id))
+                });
                 if let Some(sender) = waiter {
                     let _ = sender.send(message);
                 }
@@ -316,23 +355,20 @@ async fn read_messages(
             _ => {}
         }
     }
-    alive.store(false, Ordering::SeqCst);
-    if let Ok(mut pending) = pending.lock() {
-        pending.clear();
-    }
+    link.stop();
 }
 
 /// Own the server's stdin and write each queued line whole, so a call that times
-/// out never leaves half a line for the next message to be glued onto. A server
-/// that closed its input is marked dead, so the next call starts it again.
-async fn write_lines(
-    mut stdin: ChildStdin,
-    mut lines: mpsc::Receiver<Vec<u8>>,
-    alive: Arc<AtomicBool>,
-) {
-    while let Some(line) = lines.recv().await {
+/// out never leaves half a line for the next message to be glued onto. A request
+/// whose caller already gave up is skipped, so it never runs after its timeout. A
+/// server that closed its input is stopped, so the next call starts it again.
+async fn write_lines(mut stdin: ChildStdin, mut lines: mpsc::Receiver<Outgoing>, link: Arc<Link>) {
+    while let Some((id, line)) = lines.recv().await {
+        if id.is_some_and(|id| !link.is_waiting(id)) {
+            continue;
+        }
         if stdin.write_all(&line).await.is_err() || stdin.flush().await.is_err() {
-            alive.store(false, Ordering::SeqCst);
+            link.stop();
             break;
         }
     }
@@ -457,6 +493,34 @@ for line in sys.stdin:
         continue
     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"size": len(line)}}), flush=True)
 "#;
+
+    // Answers initialize, then leaves a child holding its stdout and exits.
+    const EXITS_EARLY: &str = r#"
+import json, subprocess, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if "id" not in msg:
+        continue
+    if msg["method"] == "initialize":
+        result = {"protocolVersion": msg["params"]["protocolVersion"], "capabilities": {}, "serverInfo": {"name": "early", "version": "1"}}
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+    else:
+        subprocess.Popen(["sleep", "30"])
+        sys.exit(0)
+"#;
+
+    #[tokio::test]
+    async fn a_server_that_exits_releases_its_callers_even_if_a_child_keeps_its_stdout() {
+        let host = McpHost::default();
+        let mut request = call("early", json!(1));
+        request.command = vec!["python3".into(), "-c".into(), EXITS_EARLY.into()];
+        let started = std::time::Instant::now();
+
+        let error = host.handle(request).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("exited before answering"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[tokio::test]
     async fn names_whose_server_never_started_do_not_count_against_the_cap() {
