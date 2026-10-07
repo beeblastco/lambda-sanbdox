@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `POST /mcp` hosts stdio MCP servers inside the VM: it starts the named
+  server's command on first use, runs the initialize handshake, keeps the
+  process alive for the VM's lifetime and relays one JSON-RPC message per call.
 - `/exec` returns `burst`: the VM's vCPU-seconds and GiB-seconds above its
   baseline since boot, so the harness can bill burst the way Lambda does.
 - The image declares a `HEALTHCHECK` against `/healthz`, so `docker ps` shows
