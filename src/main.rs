@@ -15,6 +15,7 @@ use std::sync::Arc;
 use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
     routing::post,
     Json, Router,
@@ -117,27 +118,27 @@ async fn exec_handler(State(state): State<AppState>, body: String) -> Json<ExecR
 /// failures come back as a JSON-RPC error with HTTP 200: the proxy's own 502/503
 /// mean "VM still restoring" to the harness. Every answer carries the VM's burst
 /// totals in `x-sandbox-burst`, as `/exec` does in its body, so MCP-only use bills.
-async fn mcp_handler(
-    State(state): State<AppState>,
-    body: String,
-) -> (StatusCode, [(&'static str, String); 1], Json<Value>) {
-    let (status, reply) = match serde_json::from_str::<McpRequest>(&body) {
-        Err(e) => (
-            StatusCode::OK,
-            rpc_error(None, format!("invalid request json: {e}")),
-        ),
+async fn mcp_handler(State(state): State<AppState>, body: String) -> Response {
+    let reply = match serde_json::from_str::<McpRequest>(&body) {
+        Err(e) => Some(rpc_error(None, format!("invalid request json: {e}"))),
         Ok(request) => {
             let id = request.message.get("id").cloned();
             match state.mcp.handle(request).await {
-                Ok(Some(response)) => (StatusCode::OK, response),
-                Ok(None) => (StatusCode::ACCEPTED, Value::Null),
-                Err(e) => (StatusCode::OK, rpc_error(id, format!("{e:#}"))),
+                Ok(response) => response,
+                Err(e) => Some(rpc_error(id, format!("{e:#}"))),
             }
         }
     };
-    let burst = serde_json::to_string(&burst::totals()).unwrap_or_default();
+    let burst = [(
+        "x-sandbox-burst",
+        serde_json::to_string(&burst::totals()).unwrap_or_default(),
+    )];
 
-    (status, [("x-sandbox-burst", burst)], Json(reply))
+    // A notification has no answer: a bodyless 202, as MCP's own transport sends.
+    match reply {
+        Some(reply) => (StatusCode::OK, burst, Json(reply)).into_response(),
+        None => (StatusCode::ACCEPTED, burst).into_response(),
+    }
 }
 
 fn rpc_error(id: Option<Value>, message: String) -> Value {

@@ -447,7 +447,7 @@ fn capped_text(bytes: &[u8], cap: usize) -> (String, bool) {
 
 /// SIGKILL the child's process group. A process that called `setsid` has left the
 /// group and survives, as broods's detached jobs intend.
-fn kill_process_group(child: &Child) {
+pub(crate) fn kill_process_group(child: &Child) {
     if let Some(pid) = child.id() {
         // SAFETY: killpg only sends a signal. The child was spawned with
         // process_group(0), so its pid is the group id.
