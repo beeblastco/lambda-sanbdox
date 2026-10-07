@@ -3,8 +3,8 @@ name: MicroVM image
 # Publishes this repo as an AWS Lambda MicroVM image. The MicroVM build model is
 # NOT the old ECR-image-Lambda model: AWS builds the image itself from a zip
 # containing the Dockerfile + sources, then snapshots it. This workflow zips the
-# artifact, uploads it to the SST-provisioned artifact bucket, and creates (first
-# run) or versions (subsequent runs) the MicroVM image.
+# artifact, uploads it to the SST-provisioned artifact bucket, creates (first
+# run) or versions (subsequent runs) the MicroVM image, and waits for the build.
 #
 # Required (set per deploy region as repo variables/secrets — they come from the
 # broods SST app, gated behind microvmPrereqsEnabled):
@@ -32,6 +32,12 @@ on:
 permissions:
   contents: read
   id-token: write
+
+# AWS refuses to update an image while it builds, so publishes queue instead of
+# overlapping. Each run waits for its build, so the next one starts on idle images.
+concurrency:
+  group: microvm-image
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -106,7 +112,26 @@ jobs:
           HOOKS='{"port":9000,"microvmImageHooks":{"ready":"ENABLED","readyTimeoutInSeconds":120},"microvmHooks":{"run":"ENABLED","runTimeoutInSeconds":30,"resume":"ENABLED","resumeTimeoutInSeconds":10,"suspend":"ENABLED","suspendTimeoutInSeconds":10,"terminate":"ENABLED","terminateTimeoutInSeconds":10}}'
           IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:microvm-image:${IMAGE_NAME}"
 
+          # Waits up to 30 minutes for the image to leave its in-progress states,
+          # leaving the settled state in STATE and its latest failed version in FAILED.
+          wait_for_build() {
+            for _ in $(seq 1 90); do
+              IMAGE=$(aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
+                --region "$REGION" --query '[state,latestFailedImageVersion]' --output text)
+              read -r STATE FAILED <<<"$IMAGE"
+              case "$STATE" in
+                CREATING|UPDATING|DELETING) sleep 20 ;;
+                *) return 0 ;;
+              esac
+            done
+            echo "::error::${IMAGE_ARN} still ${STATE} after 30 minutes"
+            return 1
+          }
+
           if aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" --region "$REGION" >/dev/null 2>&1; then
+            # A build started outside this workflow can still be running.
+            wait_for_build
+            FAILED_BEFORE="$FAILED"
             echo "updating existing image (new version) $IMAGE_ARN"
             aws lambda-microvms update-microvm-image \
               --image-identifier "$IMAGE_ARN" \
@@ -118,6 +143,7 @@ jobs:
               --region "$REGION"
           else
             echo "creating image $IMAGE_NAME"
+            FAILED_BEFORE="None"
             aws lambda-microvms create-microvm-image \
               --name "$IMAGE_NAME" \
               --description "AWS Lambda MicroVM agent sandbox (bash/python/node + S3 workspace mount)" \
@@ -127,5 +153,12 @@ jobs:
               --hooks "$HOOKS" \
               --additional-os-capabilities ALL \
               --region "$REGION"
+          fi
+          # A failed version can leave the image UPDATED, so a new failed version
+          # fails the run too.
+          wait_for_build
+          if [[ "$STATE" == *_FAILED || "$FAILED" != "$FAILED_BEFORE" ]]; then
+            echo "::error::MicroVM image build failed (${STATE}, failed version ${FAILED}): ${IMAGE_ARN} (artifact ${URI})"
+            exit 1
           fi
           echo "::notice::MicroVM image published: ${IMAGE_ARN} (artifact ${URI})"
