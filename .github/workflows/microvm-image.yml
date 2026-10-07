@@ -113,11 +113,12 @@ jobs:
           IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:microvm-image:${IMAGE_NAME}"
 
           # Waits up to 30 minutes for the image to leave its in-progress states,
-          # leaving the settled state in STATE.
+          # leaving the settled state in STATE and its latest failed version in FAILED.
           wait_for_build() {
             for _ in $(seq 1 90); do
-              STATE=$(aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
-                --region "$REGION" --query state --output text)
+              IMAGE=$(aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" \
+                --region "$REGION" --query '[state,latestFailedImageVersion]' --output text)
+              read -r STATE FAILED <<<"$IMAGE"
               case "$STATE" in
                 CREATING|UPDATING|DELETING) sleep 20 ;;
                 *) return 0 ;;
@@ -130,6 +131,7 @@ jobs:
           if aws lambda-microvms get-microvm-image --image-identifier "$IMAGE_ARN" --region "$REGION" >/dev/null 2>&1; then
             # A build started outside this workflow can still be running.
             wait_for_build
+            FAILED_BEFORE="$FAILED"
             echo "updating existing image (new version) $IMAGE_ARN"
             aws lambda-microvms update-microvm-image \
               --image-identifier "$IMAGE_ARN" \
@@ -141,6 +143,7 @@ jobs:
               --region "$REGION"
           else
             echo "creating image $IMAGE_NAME"
+            FAILED_BEFORE="None"
             aws lambda-microvms create-microvm-image \
               --name "$IMAGE_NAME" \
               --description "AWS Lambda MicroVM agent sandbox (bash/python/node + S3 workspace mount)" \
@@ -151,11 +154,11 @@ jobs:
               --additional-os-capabilities ALL \
               --region "$REGION"
           fi
+          # A failed version can leave the image UPDATED, so a new failed version
+          # fails the run too.
           wait_for_build
-          case "$STATE" in
-            *_FAILED)
-              echo "::error::MicroVM image build ended ${STATE}: ${IMAGE_ARN} (artifact ${URI})"
-              exit 1
-              ;;
-          esac
+          if [[ "$STATE" == *_FAILED || "$FAILED" != "$FAILED_BEFORE" ]]; then
+            echo "::error::MicroVM image build failed (${STATE}, failed version ${FAILED}): ${IMAGE_ARN} (artifact ${URI})"
+            exit 1
+          fi
           echo "::notice::MicroVM image published: ${IMAGE_ARN} (artifact ${URI})"
