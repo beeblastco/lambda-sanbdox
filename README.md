@@ -107,6 +107,26 @@ chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
 
 `mktemp -d` without `-p /tmp` puts the profile in the workspace, which is slow on a FUSE mount. For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
 
+### Obscura image
+
+```bash
+docker build --platform linux/arm64 --target obscura -t lambda-microvm-agent-sandbox:obscura .
+```
+
+The runtime image plus [Obscura](https://github.com/h4ckf0r0day/obscura), a Rust headless browser with its own V8, DOM and renderer. It adds about 77 MB and no system packages, against roughly 770 MB for the browser image. Use it to read the web; use the browser image when a screenshot must match Chrome.
+
+```bash
+obscura fetch https://example.com --dump markdown --quiet   # also text, links, html, assets, cookies
+obscura fetch https://example.com --eval "document.title" --quiet
+obscura fetch https://example.com --screenshot /tmp/shot.png --quiet
+obscura mcp                                                  # MCP server over stdio
+```
+
+- Markdown is 3 to 17x smaller than the page's HTML, which is what an agent should read.
+- Private and link-local addresses (127.0.0.1, 169.254.169.254, 10.x, 192.168.x) are refused unless `--allow-private-network` is passed.
+- Obscura renders with its embedded fonts only. Some stacked Vietnamese diacritics (ố, ớ, ị) are missing from screenshots; text dumps are unaffected.
+- Upstream Linux tarballs need glibc 2.35 and this base ships 2.34, so `.github/workflows/obscura.yml` builds the pinned commit on AL2023 and publishes it as the `obscura-v<version>` release asset the Dockerfile downloads and checks by sha256.
+
 ---
 
 ## Run Locally (HTTP server)

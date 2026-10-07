@@ -1,0 +1,115 @@
+name: Obscura binary
+
+# Builds the Obscura headless browser (https://github.com/h4ckf0r0day/obscura) for the
+# Dockerfile's `obscura` stage and publishes it as a release asset that stage downloads
+# and checks by sha256.
+#
+# Upstream's Linux tarballs are built on Ubuntu 22.04 and need glibc 2.35, while the
+# MicroVM base (AL2023) ships 2.34, so this compiles the pinned commit inside
+# amazonlinux:2023 on a native arm64 runner. Building once per version keeps the
+# 15+ minute V8 compile out of every image publish.
+#
+# To bump: change OBSCURA_VERSION and OBSCURA_COMMIT below and push. The run publishes
+# release `obscura-v<version>`; copy the sha256 from its summary into the Dockerfile.
+# A version that is already released is skipped.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/obscura.yml"
+
+permissions:
+  contents: read
+
+# One build per version at a time, so two pushes cannot both see no release and race to create it.
+concurrency:
+  group: obscura-binary
+  cancel-in-progress: false
+
+env:
+  OBSCURA_VERSION: "0.2.3"
+  OBSCURA_COMMIT: "1a3169da276d7720732c7b20535474942917fb83"
+  RUST_TOOLCHAIN: "1.96.0"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "obscura-v${OBSCURA_VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::obscura-v${OBSCURA_VERSION} is already released, nothing to build."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.released == 'false'
+    runs-on: ubuntu-24.04-arm
+    container: public.ecr.aws/amazonlinux/amazonlinux:2023
+    steps:
+      - name: Install build tools
+        run: dnf install -y gcc gcc-c++ make perl tar gzip git python3 binutils
+
+      - name: Install Rust
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Check out the pinned commit
+        run: |
+          git clone --depth 1 --branch "v${OBSCURA_VERSION}" https://github.com/h4ckf0r0day/obscura.git obscura
+          test "$(git -C obscura rev-parse HEAD)" = "${OBSCURA_COMMIT}"
+
+      - name: Build
+        working-directory: obscura
+        run: cargo build --locked --profile release-dist -p obscura-cli --bin obscura --features render
+
+      - name: Verify the binary runs on this glibc
+        working-directory: obscura/target/release-dist
+        run: |
+          ./obscura --version
+          floor=$(objdump -T obscura | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1)
+          echo "glibc floor: ${floor}"
+          test "$(printf '%s\nGLIBC_2.34\n' "$floor" | sort -V | tail -1)" = "GLIBC_2.34"
+
+      - name: Package
+        run: |
+          asset="obscura-${OBSCURA_VERSION}-aarch64-al2023.tar.gz"
+          tar -czf "$asset" -C obscura/target/release-dist obscura
+          sha256sum "$asset" | tee "$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obscura
+          path: obscura-*-aarch64-al2023.tar.gz*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: obscura
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="obscura-${OBSCURA_VERSION}-aarch64-al2023.tar.gz"
+          sha=$(cut -d' ' -f1 "$asset.sha256")
+          gh release create "obscura-v${OBSCURA_VERSION}" "$asset" "$asset.sha256" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Obscura ${OBSCURA_VERSION} for the MicroVM base (AL2023, arm64)" \
+            --notes "Obscura v${OBSCURA_VERSION} (commit ${OBSCURA_COMMIT}) built on amazonlinux:2023 with the release-dist profile and the render feature. sha256: ${sha}"
+          echo "OBSCURA_SHA256=${sha}" >> "$GITHUB_STEP_SUMMARY"

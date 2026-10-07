@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Headless Shell (arm64) on PATH as `chromium`, for screenshots, DOM dumps and
   CDP automation. `docker build --target browser` builds it; the default target
   still builds the base image.
+- Optional `obscura` build target and MicroVM image variant: the runtime image plus
+  the Obscura headless browser (markdown/text/link dumps, screenshots, JS eval, CDP
+  and MCP servers) in about 77 MB, with no Chromium. `.github/workflows/obscura.yml`
+  builds it on AL2023, because upstream tarballs need glibc 2.35.
 
 ### Fixed
 
