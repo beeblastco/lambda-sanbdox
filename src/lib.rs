@@ -281,7 +281,8 @@ async fn execute_request(
 
     // A namespaced workspace is the S3 mount, which refuses the rename and append
     // temp-file users like Chromium rely on. An ephemeral one is already local.
-    let tmpdir = if req.namespace.is_some() {
+    let namespaced = req.namespace.is_some();
+    let tmpdir = if namespaced {
         Path::new("/tmp")
     } else {
         workspace.as_path()
@@ -325,7 +326,7 @@ async fn execute_request(
     // a unified shared-data layer (Archil-style elastic POSIX FS, mountable across
     // sandboxes) that owns durability + conflict resolution in one place. Tracked
     // in filthy-panty #64; remove this flush once that layer lands.
-    if req.namespace.is_some() {
+    if namespaced {
         // SAFETY: sync() takes no arguments and has no failure mode; it flushes
         // all filesystem buffers.
         unsafe {
