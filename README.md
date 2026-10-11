@@ -98,14 +98,14 @@ docker build --platform linux/arm64 --target browser -t lambda-microvm-agent-san
 
 MicroVMs are arm64-only and `google-chrome-stable` publishes no linux-arm64 build, so this stage installs Playwright's Chrome Headless Shell and links it as `chromium`. It adds roughly 770 MB to the image.
 
-Exec runs as root with `HOME` and `TMPDIR` on the workspace mount (S3-backed in production), so keep the profile on local disk:
+Exec runs as root with `HOME` on the workspace mount (S3-backed in production), so keep the profile in `TMPDIR`, which is always on VM-local disk (`/tmp` for a namespaced exec):
 
 ```bash
 chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
-  --user-data-dir="$(mktemp -d -p /tmp)" --screenshot=/tmp/shot.png https://example.com
+  --user-data-dir="$(mktemp -d)" --screenshot=/tmp/shot.png https://example.com
 ```
 
-`mktemp -d` without `-p /tmp` puts the profile in the workspace, which is slow on a FUSE mount. For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
+For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
 
 ### Obscura image
 

@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Headless Chromium and other temp-file users no longer crash in a namespaced
+  exec. `TMPDIR` pointed at the S3 workspace mount, which refuses rename and
+  append, so Chromium died with `Trace/breakpoint trap`. A namespaced
+  exec now gets `TMPDIR=/tmp` on VM-local disk; `HOME` stays on the workspace.
 - `/mcp` no longer wedges a server after a timed-out call. The cancelled write left
   half a line in the server's input, so every later message was glued onto it and
   never answered. One writer task now writes each line whole.
