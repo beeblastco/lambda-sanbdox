@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI smoke-tests the arm64 images on a native arm64 runner. Under QEMU on
+  AVX-512 (`amd64/v4`) runners the obscura binary died with an illegal
+  instruction, so the check failed depending on the runner.
 - Headless Chromium and other temp-file users no longer crash in a namespaced
   exec. `TMPDIR` pointed at the S3 workspace mount, which refuses rename and
   append, so Chromium died with `Trace/breakpoint trap`. A namespaced

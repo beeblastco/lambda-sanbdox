@@ -42,7 +42,7 @@ A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which l
 | [Docker](https://docs.docker.com/get-docker/) | 24+ | Build and run the container locally |
 | [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | 2.x | Publish and run Lambda MicroVM images |
 
-> **Note:** The Lambda MicroVM managed base image currently publishes `linux/arm64`, so Docker builds and CI target arm64. Docker Desktop and CI runners can run the image through emulation when the host is amd64.
+> **Note:** The Lambda MicroVM managed base image currently publishes `linux/arm64`, so Docker builds and CI target arm64. Pull request CI builds and smoke-tests it on a native arm64 runner. On an amd64 host, pass `--platform linux/arm64` to `docker build` and `docker run`; Docker Desktop then runs it through emulation.
 
 ---
 
@@ -79,7 +79,7 @@ cargo test
 ## Build the Docker Image
 
 ```bash
-docker build -t lambda-microvm-agent-sandbox .
+docker build --platform linux/arm64 -t lambda-microvm-agent-sandbox .
 ```
 
 The Dockerfile is a multi-stage build:
@@ -156,8 +156,8 @@ The image runs the same `sandbox-server` locally as it does inside a MicroVM, so
 ### Start the container
 
 ```bash
-docker build -t lambda-microvm-agent-sandbox .
-docker run -d --name sandbox -p 8080:8080 -p 9000:9000 lambda-microvm-agent-sandbox
+docker build --platform linux/arm64 -t lambda-microvm-agent-sandbox .
+docker run -d --platform linux/arm64 --name sandbox -p 8080:8080 -p 9000:9000 lambda-microvm-agent-sandbox
 sleep 3
 ```
 
