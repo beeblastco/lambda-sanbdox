@@ -18,7 +18,7 @@ pub mod mount;
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
 use tokio::fs;
@@ -279,6 +279,14 @@ async fn execute_request(
         bash_command.push_str(&quoted);
     }
 
+    // A namespaced workspace is the S3 mount, which refuses the rename and append
+    // temp-file users like Chromium rely on. An ephemeral one is already local.
+    let tmpdir = if req.namespace.is_some() {
+        Path::new("/tmp")
+    } else {
+        workspace.as_path()
+    };
+
     let mut command = Command::new("bash");
     command
         .arg("-lc")
@@ -286,7 +294,7 @@ async fn execute_request(
         .current_dir(workspace)
         .env_clear()
         .env("HOME", workspace)
-        .env("TMPDIR", workspace)
+        .env("TMPDIR", tmpdir)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/bin")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -583,6 +591,20 @@ mod exec_tests {
         assert!(cut.stdout.ends_with("...[truncated]"));
         assert!(!fits.truncated);
         assert_eq!(fits.stdout.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn a_namespaced_exec_keeps_home_on_the_workspace_and_tmpdir_off_it() {
+        let root = std::env::temp_dir().join(format!("tmpdir-test-{}", uuid::Uuid::new_v4()));
+        let mut request = bash("printf '%s\\n%s' \"$HOME\" \"$TMPDIR\"", 10_000);
+        request.namespace = Some(format!("fs-{}", "a".repeat(40)));
+        request.workspace_root = Some(root.display().to_string());
+
+        let response = run_exec(request).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(response.ok, "{}", response.stderr);
+        assert_eq!(response.stdout, format!("{}\n/tmp", response.workspace));
     }
 }
 

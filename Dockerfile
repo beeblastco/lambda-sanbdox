@@ -86,10 +86,10 @@ CMD ["/usr/local/bin/sandbox-server"]
 # arm64-only and google-chrome-stable ships no linux-arm64 build, so this installs
 # Playwright's Chrome Headless Shell and exposes it as `chromium`.
 #
-# Exec runs as root with HOME and TMPDIR on the workspace mount, so keep the profile
-# on local disk:
+# Exec runs as root with HOME on the workspace mount, so keep the profile in TMPDIR,
+# which is always on VM-local disk:
 #   chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
-#     --user-data-dir="$(mktemp -d -p /tmp)" --screenshot=/tmp/shot.png https://example.com
+#     --user-data-dir="$(mktemp -d)" --screenshot=/tmp/shot.png https://example.com
 # From Node, point playwright-core at it: chromium.launch({ executablePath: "/usr/local/bin/chromium" }).
 FROM runtime AS browser
 
