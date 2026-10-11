@@ -105,7 +105,7 @@ chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
   --user-data-dir="$(mktemp -d)" --screenshot=/tmp/shot.png https://example.com
 ```
 
-For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Execs get `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`, so `playwright@1.63.0` also finds the baked browser without `executablePath`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
+For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Execs and `/mcp` servers get `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`, so `playwright@1.63.0` also finds the baked browser without `executablePath`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
 
 ### Obscura image
 

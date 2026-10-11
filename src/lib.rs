@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -59,6 +60,14 @@ const CACHE_ENV: [(&str, &str); 4] = [
 // Where the browser image bakes Chrome Headless Shell, so Playwright finds it there
 // instead of downloading it again.
 const PLAYWRIGHT_BROWSERS_PATH: &str = "/opt/ms-playwright";
+
+// Exec and MCP servers set this so Playwright uses the browser image's baked
+// Chromium. Only that image has the directory, and it never changes at runtime.
+pub(crate) static BAKED_BROWSERS: LazyLock<Option<(&str, &str)>> = LazyLock::new(|| {
+    Path::new(PLAYWRIGHT_BROWSERS_PATH)
+        .is_dir()
+        .then_some(("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH))
+});
 
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
@@ -312,6 +321,7 @@ async fn execute_request(
         .env("TMPDIR", tmpdir)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/bin")
         .envs(CACHE_ENV)
+        .envs(*BAKED_BROWSERS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -319,9 +329,6 @@ async fn execute_request(
         .process_group(0)
         .kill_on_drop(true);
 
-    if Path::new(PLAYWRIGHT_BROWSERS_PATH).is_dir() {
-        command.env("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH);
-    }
     // Last, so a caller's value wins over every default above.
     for (key, value) in &req.env {
         command.env(key, value);
