@@ -170,7 +170,7 @@ impl McpServer {
     async fn start(request: &McpRequest) -> anyhow::Result<Arc<Self>> {
         let mut child = Command::new(&request.command[0])
             .args(&request.command[1..])
-            .envs(*crate::BAKED_BROWSERS)
+            .envs(crate::BAKED_BROWSERS.iter().copied())
             .envs(&request.env)
             .current_dir("/tmp")
             .process_group(0)

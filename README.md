@@ -105,7 +105,7 @@ chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
   --user-data-dir="$(mktemp -d)" --screenshot=/tmp/shot.png https://example.com
 ```
 
-For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Execs and `/mcp` servers get `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright`, so `playwright@1.63.0` also finds the baked browser without `executablePath`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
+For CDP automation, install `playwright-core` at run time and point it at the binary: `chromium.launch({ executablePath: "/usr/local/bin/chromium" })`. Execs and `/mcp` servers get `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright` (and `PLAYWRIGHT_SKIP_BROWSER_GC=1`), so `playwright@1.63.0` also finds the baked browser without `executablePath`. Chromium logs harmless D-Bus and GPU warnings to stderr in a MicroVM.
 
 ### Obscura image
 
@@ -325,7 +325,7 @@ The namespace must match `fs-[a-f0-9]{40}`. In the MicroVM deployment path, the 
 
 #### Environment
 
-Every exec starts from a cleared environment with `HOME` set to its workspace, so dotfiles, config and shell history persist in a namespaced one. `TMPDIR` is `/tmp` for a namespaced exec and the workspace for an ephemeral one. Tool caches always go to VM-local disk under `/tmp/.cache`: `XDG_CACHE_HOME` (pip, uv, Playwright, Chromium), `npm_config_cache`, `PIP_CACHE_DIR` and `BUN_INSTALL_CACHE_DIR`. They are shared by every exec on the VM and gone when it is replaced. In the browser image `PLAYWRIGHT_BROWSERS_PATH` is `/opt/ms-playwright`, where the image bakes Chrome Headless Shell. A variable in the request's `env` overrides any of these.
+Every exec starts from a cleared environment with `HOME` set to its workspace, so dotfiles, config and shell history persist in a namespaced one. `TMPDIR` is `/tmp` for a namespaced exec and the workspace for an ephemeral one. Tool caches always go to VM-local disk under `/tmp/.cache`: `XDG_CACHE_HOME` (pip, uv, Playwright, Chromium) and `npm_config_cache` (npm ignores XDG). They are shared by every exec on the VM and gone when it is replaced. In the browser image `PLAYWRIGHT_BROWSERS_PATH` is `/opt/ms-playwright`, where the image bakes Chrome Headless Shell, with `PLAYWRIGHT_SKIP_BROWSER_GC=1` so a `playwright install` doesn't delete it. A variable in the request's `env` overrides any of these.
 
 #### Write durability
 

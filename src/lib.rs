@@ -49,24 +49,30 @@ const DEFAULT_WORKSPACE_ROOT: &str = "/mnt/workspaces";
 
 // Tool caches on VM-local disk. HOME can be the S3 workspace mount (a namespaced
 // exec, or a caller pointing HOME there), which is slow and refuses the rename and
-// append npm and pip rely on. pip, uv, Playwright and Chromium follow XDG.
-const CACHE_ENV: [(&str, &str); 4] = [
+// append npm and pip rely on. pip, uv, Playwright and Chromium follow XDG; npm
+// does not.
+const CACHE_ENV: [(&str, &str); 2] = [
     ("XDG_CACHE_HOME", "/tmp/.cache"),
     ("npm_config_cache", "/tmp/.cache/npm"),
-    ("PIP_CACHE_DIR", "/tmp/.cache/pip"),
-    ("BUN_INSTALL_CACHE_DIR", "/tmp/.cache/bun"),
 ];
 
 // Where the browser image bakes Chrome Headless Shell, so Playwright finds it there
 // instead of downloading it again.
 const PLAYWRIGHT_BROWSERS_PATH: &str = "/opt/ms-playwright";
 
-// Exec and MCP servers set this so Playwright uses the browser image's baked
-// Chromium. Only that image has the directory, and it never changes at runtime.
-pub(crate) static BAKED_BROWSERS: LazyLock<Option<(&str, &str)>> = LazyLock::new(|| {
-    Path::new(PLAYWRIGHT_BROWSERS_PATH)
-        .is_dir()
-        .then_some(("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH))
+// Exec and MCP servers set these so Playwright uses the browser image's baked
+// Chromium; only that image ships the directory, checked once at startup. The
+// image dropped the npm install that registered the baked browser, so without
+// SKIP_BROWSER_GC any `playwright install` would delete it as unused.
+pub(crate) static BAKED_BROWSERS: LazyLock<&[(&str, &str)]> = LazyLock::new(|| {
+    if Path::new(PLAYWRIGHT_BROWSERS_PATH).is_dir() {
+        &[
+            ("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH),
+            ("PLAYWRIGHT_SKIP_BROWSER_GC", "1"),
+        ]
+    } else {
+        &[]
+    }
 });
 
 #[derive(Debug, Deserialize)]
@@ -321,7 +327,7 @@ async fn execute_request(
         .env("TMPDIR", tmpdir)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/bin")
         .envs(CACHE_ENV)
-        .envs(*BAKED_BROWSERS)
+        .envs(BAKED_BROWSERS.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -638,7 +644,7 @@ mod exec_tests {
     async fn a_namespaced_exec_keeps_tool_caches_off_the_workspace_unless_the_caller_sets_them() {
         let root = std::env::temp_dir().join(format!("cache-test-{}", uuid::Uuid::new_v4()));
         let mut request = bash(
-            "printf '%s\\n' \"$XDG_CACHE_HOME\" \"$npm_config_cache\" \"$PIP_CACHE_DIR\" \"$BUN_INSTALL_CACHE_DIR\"",
+            "printf '%s\\n' \"$XDG_CACHE_HOME\" \"$npm_config_cache\"",
             10_000,
         );
         request.namespace = Some(format!("fs-{}", "a".repeat(40)));
@@ -651,10 +657,7 @@ mod exec_tests {
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(response.ok, "{}", response.stderr);
-        assert_eq!(
-            response.stdout,
-            "/tmp/.cache\n/caller/npm\n/tmp/.cache/pip\n/tmp/.cache/bun\n"
-        );
+        assert_eq!(response.stdout, "/tmp/.cache\n/caller/npm\n");
     }
 }
 

@@ -40,10 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exec now gets `TMPDIR=/tmp` on VM-local disk; `HOME` stays on the workspace.
 - npm, pip and other tools no longer write their caches to the S3 workspace
   mount, which is slow and refuses the rename and append they rely on. Every
-  exec now gets `XDG_CACHE_HOME`, `npm_config_cache`, `PIP_CACHE_DIR` and
-  `BUN_INSTALL_CACHE_DIR` under `/tmp/.cache`, and the browser image's execs get
-  `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright` so Playwright uses the baked
-  browser. A value in the request's `env` still wins.
+  exec now gets `XDG_CACHE_HOME` and `npm_config_cache` under `/tmp/.cache`. In
+  the browser image, execs and `/mcp` servers get
+  `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright` and
+  `PLAYWRIGHT_SKIP_BROWSER_GC=1`, so Playwright uses the baked browser and a
+  `playwright install` doesn't delete it. A value in the request's `env` still
+  wins.
 - `/mcp` no longer wedges a server after a timed-out call. The cancelled write left
   half a line in the server's input, so every later message was glued onto it and
   never answered. One writer task now writes each line whole.
