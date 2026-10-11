@@ -72,6 +72,7 @@ jobs:
               - 'Cargo.lock'
               - 'Dockerfile'
               - '.dockerignore'
+              - '.github/workflows/ci.yml'
       # A manual run forces docker=true so the build + ECR push always happens.
       - id: decide
         run: |
@@ -83,7 +84,9 @@ jobs:
 
   # ─── Docker build & smoke test (PRs only, image-relevant changes only) ───
   docker-build:
-    runs-on: ubuntu-latest
+    # Native arm64: the images are arm64-only, and under QEMU the obscura binary
+    # died with an illegal instruction on AVX-512 (amd64/v4) runners.
+    runs-on: ubuntu-24.04-arm
     needs: [rust-checks, changes]
     if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     permissions:
@@ -92,9 +95,6 @@ jobs:
       DOCKER_PLATFORM: linux/arm64
     steps:
       - uses: actions/checkout@v5
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -114,8 +114,6 @@ jobs:
 
       - name: Smoke test
         run: |
-          # The Lambda MicroVM base image is arm64-only. GitHub's x64 runners run
-          # this container through QEMU, which is enough for the stateless smoke test.
           docker run -d --name sandbox-smoke -p 8080:8080 -p 9000:9000 lambda-microvm-agent-sandbox:local
           sleep 4
           # Lifecycle /ready hook is up (200).

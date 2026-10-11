@@ -42,7 +42,7 @@ A MicroVM boots from a snapshot of this image and runs `sandbox-server`, which l
 | [Docker](https://docs.docker.com/get-docker/) | 24+ | Build and run the container locally |
 | [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | 2.x | Publish and run Lambda MicroVM images |
 
-> **Note:** The Lambda MicroVM managed base image currently publishes `linux/arm64`, so Docker builds and CI target arm64. Docker Desktop and CI runners can run the image through emulation when the host is amd64.
+> **Note:** The Lambda MicroVM managed base image currently publishes `linux/arm64`, so Docker builds and CI target arm64. CI builds and smoke-tests it on a native arm64 runner; Docker Desktop runs it through emulation on an amd64 host.
 
 ---
 
