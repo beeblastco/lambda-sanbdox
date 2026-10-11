@@ -46,6 +46,20 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024; // 16 MB
 const DEFAULT_WORKSPACE_ROOT: &str = "/mnt/workspaces";
 
+// Tool caches on VM-local disk. HOME can be the S3 workspace mount (a namespaced
+// exec, or a caller pointing HOME there), which is slow and refuses the rename and
+// append npm and pip rely on. pip, uv, Playwright and Chromium follow XDG.
+const CACHE_ENV: [(&str, &str); 4] = [
+    ("XDG_CACHE_HOME", "/tmp/.cache"),
+    ("npm_config_cache", "/tmp/.cache/npm"),
+    ("PIP_CACHE_DIR", "/tmp/.cache/pip"),
+    ("BUN_INSTALL_CACHE_DIR", "/tmp/.cache/bun"),
+];
+
+// Where the browser image bakes Chrome Headless Shell, so Playwright finds it there
+// instead of downloading it again.
+const PLAYWRIGHT_BROWSERS_PATH: &str = "/opt/ms-playwright";
+
 #[derive(Debug, Deserialize)]
 pub struct ExecRequest {
     #[serde(default = "default_runtime")]
@@ -297,6 +311,7 @@ async fn execute_request(
         .env("HOME", workspace)
         .env("TMPDIR", tmpdir)
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/bin")
+        .envs(CACHE_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -304,6 +319,10 @@ async fn execute_request(
         .process_group(0)
         .kill_on_drop(true);
 
+    if Path::new(PLAYWRIGHT_BROWSERS_PATH).is_dir() {
+        command.env("PLAYWRIGHT_BROWSERS_PATH", PLAYWRIGHT_BROWSERS_PATH);
+    }
+    // Last, so a caller's value wins over every default above.
     for (key, value) in &req.env {
         command.env(key, value);
     }
@@ -606,6 +625,29 @@ mod exec_tests {
 
         assert!(response.ok, "{}", response.stderr);
         assert_eq!(response.stdout, format!("{}\n/tmp", response.workspace));
+    }
+
+    #[tokio::test]
+    async fn a_namespaced_exec_keeps_tool_caches_off_the_workspace_unless_the_caller_sets_them() {
+        let root = std::env::temp_dir().join(format!("cache-test-{}", uuid::Uuid::new_v4()));
+        let mut request = bash(
+            "printf '%s\\n' \"$XDG_CACHE_HOME\" \"$npm_config_cache\" \"$PIP_CACHE_DIR\" \"$BUN_INSTALL_CACHE_DIR\"",
+            10_000,
+        );
+        request.namespace = Some(format!("fs-{}", "a".repeat(40)));
+        request.workspace_root = Some(root.display().to_string());
+        request
+            .env
+            .insert("npm_config_cache".to_string(), "/caller/npm".to_string());
+
+        let response = run_exec(request).await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(response.ok, "{}", response.stderr);
+        assert_eq!(
+            response.stdout,
+            "/tmp/.cache\n/caller/npm\n/tmp/.cache/pip\n/tmp/.cache/bun\n"
+        );
     }
 }
 
