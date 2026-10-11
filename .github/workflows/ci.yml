@@ -59,6 +59,7 @@ jobs:
       contents: read
     outputs:
       docker: ${{ steps.decide.outputs.docker }}
+      smoke: ${{ steps.filter.outputs.smoke }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v4
@@ -67,6 +68,14 @@ jobs:
         with:
           filters: |
             docker:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'Dockerfile'
+              - '.dockerignore'
+            # The PR smoke test also reruns when this workflow changes; the
+            # main-branch image push does not.
+            smoke:
               - 'src/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -88,7 +97,7 @@ jobs:
     # died with an illegal instruction on AVX-512 (amd64/v4) runners.
     runs-on: ubuntu-24.04-arm
     needs: [rust-checks, changes]
-    if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.smoke == 'true'
     permissions:
       contents: read
     env:
