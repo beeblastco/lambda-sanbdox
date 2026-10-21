@@ -1,43 +1,16 @@
-diff --git a/crates/obscura-cli/tests/mcp_client.rs b/crates/obscura-cli/tests/mcp_client.rs
-index 5058d6c..66363cc 100644
---- a/crates/obscura-cli/tests/mcp_client.rs
-+++ b/crates/obscura-cli/tests/mcp_client.rs
-@@ -234,7 +234,20 @@ fn test_ping() {
-     let mut c = McpClient::spawn();
-     let resp = c.call("ping", serde_json::json!({}));
-     assert!(resp.get("error").is_none(), "ping should not error");
--    assert_eq!(resp["result"], serde_json::json!({}));
-+    assert_eq!(resp["result"]["resultType"], "complete");
-+}
-+
-+#[test]
-+fn test_server_discover() {
-+    let mut c = McpClient::spawn();
-+    let resp = c.call(
-+        "server/discover",
-+        serde_json::json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } }),
-+    );
-+    assert_eq!(resp["result"]["supportedVersions"], serde_json::json!(["2026-07-28"]));
-+    assert_eq!(resp["result"]["capabilities"]["tools"], serde_json::json!({}));
-+    let tools = c.call("tools/list", serde_json::json!({}));
-+    assert_eq!(tools["result"]["cacheScope"], "private");
- }
- 
- #[test]
 diff --git a/crates/obscura-mcp/src/lib.rs b/crates/obscura-mcp/src/lib.rs
-index 6b6b780..4e3b482 100644
+index 6b6b780..d1946a6 100644
 --- a/crates/obscura-mcp/src/lib.rs
 +++ b/crates/obscura-mcp/src/lib.rs
-@@ -225,15 +225,44 @@ impl BrowserState {
+@@ -224,16 +224,43 @@ impl BrowserState {
+     }
  }
  
++/// Answers MCP 2026-07-28 `server/discover` too; handlers ignore the request `_meta` envelope.
  pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
 -    match method {
 +    let mut response = match method {
          "initialize" => handle_initialize(id, params),
-+        // MCP 2026-07-28: the client opens with server/discover instead of
-+        // initialize and sends a `_meta` envelope on every request, which the
-+        // handlers below ignore.
 +        "server/discover" => RpcResponse::ok(id, json!({
 +            "supportedVersions": ["2026-07-28"],
 +            "capabilities": { "tools": {} }

@@ -5,8 +5,7 @@
 //! `server/discover`; later ones reuse the same process, so a stateful server (a
 //! browser session, say) keeps its state for as long as the VM lives. The host
 //! speaks MCP 2026-07-28 only: every message it writes carries that revision's
-//! `_meta` envelope, and a server that does not offer it is refused, with no
-//! fallback to the 2025 `initialize` handshake.
+//! `_meta` envelope, and a server that does not offer it is refused.
 //! A server whose process exited, or whose command or environment changed, is
 //! started again. Exec already runs arbitrary code as root here, so starting a
 //! command is no new privilege; the MicroVM stays the isolation boundary.
@@ -28,9 +27,11 @@ use crate::{kill_group, MAX_REQUEST_BYTES};
 
 /// The only MCP revision the host speaks.
 const PROTOCOL_VERSION: &str = "2026-07-28";
-/// The `_meta` keys of the envelope that revision puts on every message.
+/// Envelope `_meta` key: the revision a message speaks.
 const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+/// Envelope `_meta` key: who sends it.
 const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+/// Envelope `_meta` key: the client features it offers; the host offers none.
 const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
@@ -54,7 +55,8 @@ pub struct McpRequest {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// One JSON-RPC request or notification, forwarded as is apart from its id.
+    /// One JSON-RPC request or notification, forwarded with the `_meta` envelope
+    /// added and a host-assigned id.
     pub message: Value,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -70,7 +72,7 @@ pub struct McpHost {
 impl McpHost {
     /// Forward one message and return the server's JSON-RPC response, or `None`
     /// for a notification, which has none.
-    pub async fn handle(&self, request: McpRequest) -> anyhow::Result<Option<Value>> {
+    pub async fn handle(&self, mut request: McpRequest) -> anyhow::Result<Option<Value>> {
         if request.server.trim().is_empty() {
             bail!("server is required");
         }
@@ -85,6 +87,7 @@ impl McpHost {
         {
             bail!("message must be a JSON-RPC request or notification");
         }
+        with_envelope(&mut request.message)?;
         let server = self.server(&request).await?;
         let wait = Duration::from_millis(request.timeout_ms.clamp(1, MAX_TIMEOUT_MS));
 
@@ -137,14 +140,6 @@ struct McpServer {
     outbox: mpsc::Sender<Outgoing>,
     link: Arc<Link>,
     next_id: AtomicU64,
-}
-
-/// A server nothing holds any more stops its process: one refused at discover, or
-/// one whose start was cancelled by a dropped request, never lingers.
-impl Drop for McpServer {
-    fn drop(&mut self) {
-        self.link.stop();
-    }
 }
 
 /// What a server's reader, writer and exit watcher share. Whichever of them sees
@@ -220,7 +215,9 @@ impl McpServer {
             link,
             next_id: AtomicU64::new(1),
         });
-        server.discover().await?;
+        server.discover().await.with_context(|| {
+            format!("MCP server does not speak MCP {PROTOCOL_VERSION}, the only revision this host supports")
+        })?;
 
         Ok(server)
     }
@@ -230,34 +227,31 @@ impl McpServer {
     /// `{ pin }` mode. A 2025-only server answers with an error such as -32601 or
     /// -32022, or exits; each is refused, never retried with `initialize`.
     async fn discover(&self) -> anyhow::Result<()> {
-        let refused = |reason: String| {
-            anyhow!("MCP server does not speak MCP {PROTOCOL_VERSION}, the only revision this host supports: {reason}")
-        };
-        let probe = json!({ "jsonrpc": "2.0", "id": 0, "method": "server/discover" });
+        let mut probe = json!({ "jsonrpc": "2.0", "id": 0, "method": "server/discover" });
+        with_envelope(&mut probe)?;
         let response = self
             .forward(probe, DISCOVER_TIMEOUT)
-            .await
-            .and_then(|response| response.context("server/discover got no response"))
-            .map_err(|error| refused(format!("{error:#}")))?;
+            .await?
+            .context("server/discover got no response")?;
         if let Some(error) = response.get("error") {
-            return Err(refused(format!("server/discover answered {error}")));
+            bail!("server/discover answered {error}");
         }
         let supported = &response["result"]["supportedVersions"];
         let offered = supported
             .as_array()
             .is_some_and(|versions| versions.iter().any(|version| version == PROTOCOL_VERSION));
         if !offered {
-            return Err(refused(format!("it offers {supported}")));
+            bail!("it offers {supported}");
         }
 
         Ok(())
     }
 
-    /// Send one message under a host-assigned id, so concurrent callers can never
-    /// collide, then hand the caller back its own id on the response. One deadline
-    /// covers the queueing and the wait, so a server that stops reading cannot hang it.
-    async fn forward(&self, message: Value, wait: Duration) -> anyhow::Result<Option<Value>> {
-        let mut message = with_envelope(message)?;
+    /// Send one message, which already carries the `_meta` envelope, under a
+    /// host-assigned id, so concurrent callers can never collide, then hand the
+    /// caller back its own id on the response. One deadline covers the queueing
+    /// and the wait, so a server that stops reading cannot hang it.
+    async fn forward(&self, mut message: Value, wait: Duration) -> anyhow::Result<Option<Value>> {
         let original_id = message.get("id").cloned();
         let waiter = original_id.as_ref().map(|_| {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -300,6 +294,14 @@ impl McpServer {
         }
 
         Ok(response)
+    }
+}
+
+/// A server nothing holds any more stops its process: one refused at discover, or
+/// one whose start was cancelled by a dropped request, never lingers.
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        self.link.stop();
     }
 }
 
@@ -373,36 +375,6 @@ async fn write_lines(mut stdin: ChildStdin, mut lines: mpsc::Receiver<Outgoing>,
     }
 }
 
-/// Put the 2026-07-28 `_meta` envelope on a request or notification. Keys the
-/// caller already set in `_meta` win, as they do in the SDK client.
-fn with_envelope(mut message: Value) -> anyhow::Result<Value> {
-    let meta = message
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("message must be a JSON object"))?
-        .entry("params")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("message params must be an object"))?
-        .entry("_meta")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("message params._meta must be an object"))?;
-    let envelope = [
-        (PROTOCOL_VERSION_KEY, json!(PROTOCOL_VERSION)),
-        (
-            CLIENT_INFO_KEY,
-            json!({ "name": "sandbox-server", "version": env!("CARGO_PKG_VERSION") }),
-        ),
-        // The host offers no client features: no sampling, elicitation or roots.
-        (CLIENT_CAPABILITIES_KEY, json!({})),
-    ];
-    for (key, value) in envelope {
-        meta.entry(key).or_insert(value);
-    }
-
-    Ok(message)
-}
-
 fn encode(message: &Value) -> anyhow::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
@@ -414,19 +386,56 @@ fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
+/// Put the 2026-07-28 `_meta` envelope on a request or notification. Keys the
+/// caller already set in `_meta` win, as they do in the SDK client.
+fn with_envelope(message: &mut Value) -> anyhow::Result<()> {
+    let params = message
+        .as_object_mut()
+        .context("message must be a JSON object")?
+        .entry("params")
+        .or_insert(Value::Null);
+    if params.is_null() {
+        *params = json!({});
+    }
+    let meta = params
+        .as_object_mut()
+        .context("message params must be an object")?
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("message params._meta must be an object")?;
+    let envelope = [
+        (PROTOCOL_VERSION_KEY, json!(PROTOCOL_VERSION)),
+        (
+            CLIENT_INFO_KEY,
+            json!({ "name": "sandbox-server", "version": env!("CARGO_PKG_VERSION") }),
+        ),
+        (CLIENT_CAPABILITIES_KEY, json!({})),
+    ];
+    for (key, value) in envelope {
+        meta.entry(key).or_insert(value);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A stdio MCP 2026-07-28 server in a few lines of Python: answers -32022 to a
-    // request without that revision's envelope, as the SDK's stdio entry does,
-    // answers server/discover, counts tools/call so a reused process is visible,
-    // echoes the request's _meta, and ignores notifications.
-    const FAKE_SERVER: &str = r#"
-import json, sys
+    // A stdio MCP 2026-07-28 server in Python, strict as the SDK's stdio entry:
+    // -32022 to a request without that revision's envelope, an answer to
+    // server/discover, and HANDLER for every other request, which sets `reply` or
+    // writes its own. Notifications are ignored. PAUSE_AFTER_DISCOVER seconds
+    // without reading follow the discover answer.
+    const FAKE_LOOP: &str = r#"
+import json, os, subprocess, sys, time
 calls = 0
 for line in sys.stdin:
-    msg = json.loads(line)
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
     if "method" not in msg or "id" not in msg:
         continue
     meta = msg.get("params", {}).get("_meta", {})
@@ -436,15 +445,34 @@ for line in sys.stdin:
     elif msg["method"] == "server/discover":
         reply = {"result": {"supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}}
     else:
-        calls += 1
-        reply = {"result": {"resultType": "complete", "content": [{"type": "text", "text": f"call {calls}"}], "meta": meta}}
+HANDLER
     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], **reply}), flush=True)
+    if msg["method"] == "server/discover":
+        time.sleep(float(os.environ.get("PAUSE_AFTER_DISCOVER", "0")))
 "#;
+
+    // Counts tools/call so a reused process is visible, and echoes the request's _meta.
+    const COUNTER: &str = r#"
+calls += 1
+reply = {"result": {"resultType": "complete", "content": [{"type": "text", "text": f"call {calls}"}], "meta": meta}}
+"#;
+
+    /// argv of a FAKE_LOOP server whose other requests run `handler`.
+    fn fake(handler: &str) -> Vec<String> {
+        let handler: Vec<String> = handler
+            .trim()
+            .lines()
+            .map(|line| format!("        {line}"))
+            .collect();
+        let script = FAKE_LOOP.replace("HANDLER", &handler.join("\n"));
+
+        vec!["python3".into(), "-c".into(), script]
+    }
 
     fn call(server: &str, id: Value) -> McpRequest {
         McpRequest {
             server: server.to_string(),
-            command: vec!["python3".into(), "-c".into(), FAKE_SERVER.into()],
+            command: fake(COUNTER),
             env: HashMap::new(),
             message: json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {} }),
             timeout_ms: 10_000,
@@ -481,18 +509,13 @@ for line in sys.stdin:
         assert_eq!(meta["progressToken"], json!("p"));
     }
 
-    // A 2025-era server: answers initialize and nothing else.
+    // A 2025-era server as the host sees it: server/discover is an unknown method.
     const LEGACY_SERVER: &str = r#"
 import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
-    if "id" not in msg:
-        continue
-    if msg["method"] == "initialize":
-        reply = {"result": {"protocolVersion": "2025-06-18", "capabilities": {}, "serverInfo": {"name": "legacy", "version": "1"}}}
-    else:
-        reply = {"error": {"code": -32601, "message": "Method not found"}}
-    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], **reply}), flush=True)
+    if "id" in msg:
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "Method not found"}}), flush=True)
 "#;
 
     #[tokio::test]
@@ -511,11 +534,10 @@ for line in sys.stdin:
     async fn refuses_a_server_whose_discover_does_not_offer_2026() {
         let host = McpHost::default();
         let mut request = call("future", json!(1));
-        let server = FAKE_SERVER.replace(
+        request.command[2] = request.command[2].replace(
             r#""supportedVersions": ["2026-07-28"]"#,
             r#""supportedVersions": ["2027-01-01"]"#,
         );
-        request.command = vec!["python3".into(), "-c".into(), server];
 
         let error = format!("{:#}", host.handle(request).await.unwrap_err());
 
@@ -550,15 +572,8 @@ time.sleep(60)
             .is_err());
         let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
         std::fs::remove_file(&pid_file).ok();
-        let started = std::time::Instant::now();
-        // SAFETY: signal 0 only checks that the process exists.
-        while unsafe { libc::kill(pid, 0) } == 0 {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "server {pid} still running"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+
+        assert!(crate::wait_gone(pid).await, "server {pid} still running");
     }
 
     #[tokio::test]
@@ -590,46 +605,17 @@ time.sleep(60)
         assert!(host.handle(request).await.is_err());
     }
 
-    // A server that stops reading for a second after server/discover, then echoes
-    // every line it can parse. A call that times out mid-write must not leave half
-    // a line in its input for the next call to be glued onto.
-    const SLOW_READER: &str = r#"
-import json, sys, time
-for line in sys.stdin:
-    try:
-        msg = json.loads(line)
-    except ValueError:
-        continue
-    if "id" not in msg:
-        continue
-    if msg.get("method") == "server/discover":
-        result = {"supportedVersions": ["2026-07-28"], "capabilities": {}}
-        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
-        time.sleep(1)
-        continue
-    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"size": len(line)}}), flush=True)
-"#;
-
-    // Answers server/discover, then leaves a child holding its stdout and exits.
+    // Leaves a child holding its stdout and exits.
     const EXITS_EARLY: &str = r#"
-import json, subprocess, sys
-for line in sys.stdin:
-    msg = json.loads(line)
-    if "id" not in msg:
-        continue
-    if msg["method"] == "server/discover":
-        result = {"supportedVersions": ["2026-07-28"], "capabilities": {}}
-        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
-    else:
-        subprocess.Popen(["sleep", "30"])
-        sys.exit(0)
+subprocess.Popen(["sleep", "30"])
+sys.exit(0)
 "#;
 
     #[tokio::test]
     async fn a_server_that_exits_releases_its_callers_even_if_a_child_keeps_its_stdout() {
         let host = McpHost::default();
         let mut request = call("early", json!(1));
-        request.command = vec!["python3".into(), "-c".into(), EXITS_EARLY.into()];
+        request.command = fake(EXITS_EARLY);
         let started = std::time::Instant::now();
 
         let error = host.handle(request).await.unwrap_err();
@@ -650,48 +636,50 @@ for line in sys.stdin:
         assert!(host.handle(call("fake", json!(1))).await.is_ok());
     }
 
-    // Answers server/discover, then every request with one line of argv[1] bytes.
+    // Answers with one line of argv[1] bytes, then waits for the next request.
     const HUGE_REPLY: &str = r#"
-import json, sys
-for line in sys.stdin:
-    msg = json.loads(line)
-    if "id" not in msg:
-        continue
-    if msg["method"] == "server/discover":
-        result = {"supportedVersions": ["2026-07-28"], "capabilities": {}}
-        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
-    else:
-        sys.stdout.write("x" * int(sys.argv[1]) + "\n")
-        sys.stdout.flush()
+sys.stdout.write("x" * int(sys.argv[1]) + "\n")
+sys.stdout.flush()
+continue
 "#;
 
     #[tokio::test]
     async fn an_oversized_response_stops_the_server_instead_of_buffering_it() {
         let host = McpHost::default();
         let mut request = call("huge", json!(1));
-        request.command = vec![
-            "python3".into(),
-            "-c".into(),
-            HUGE_REPLY.into(),
-            (MAX_REQUEST_BYTES + 1).to_string(),
-        ];
+        request.command = fake(HUGE_REPLY);
+        request.command.push((MAX_REQUEST_BYTES + 1).to_string());
 
         let error = host.handle(request).await.unwrap_err();
 
         assert!(format!("{error:#}").contains("exited before answering"));
     }
 
+    // Echoes the size of each request line it reads.
+    const SIZE_ECHO: &str = r#"
+reply = {"result": {"size": len(line)}}
+"#;
+
+    // The server stops reading for a second after server/discover. A call that
+    // times out mid-write must not leave half a line in its input for the next
+    // call to be glued onto.
     #[tokio::test]
     async fn a_timed_out_write_does_not_corrupt_the_next_message() {
         let host = McpHost::default();
-        let mut big = call("slow", json!(1));
-        big.command = vec!["python3".into(), "-c".into(), SLOW_READER.into()];
+        let slow = |id: Value| {
+            let mut request = call("slow", id);
+            request.command = fake(SIZE_ECHO);
+            request
+                .env
+                .insert("PAUSE_AFTER_DISCOVER".into(), "1".into());
+            request
+        };
+        let mut big = slow(json!(1));
         big.message["params"] = json!({ "pad": "x".repeat(1 << 20) });
         big.timeout_ms = 200;
         assert!(host.handle(big).await.is_err());
 
-        let mut small = call("slow", json!(2));
-        small.command = vec!["python3".into(), "-c".into(), SLOW_READER.into()];
+        let mut small = slow(json!(2));
         small.timeout_ms = 5_000;
         let response = host.handle(small).await.unwrap().unwrap();
 

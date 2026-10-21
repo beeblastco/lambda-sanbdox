@@ -125,7 +125,7 @@ obscura mcp                                                  # MCP server over s
 - Markdown is 3 to 17x smaller than the page's HTML, which is what an agent should read.
 - Private and link-local addresses (127.0.0.1, 169.254.169.254, 10.x, 192.168.x) are refused unless `--allow-private-network` is passed.
 - Obscura renders with its embedded fonts only. Some stacked Vietnamese diacritics (ố, ớ, ị) are missing from screenshots; text dumps are unaffected.
-- Upstream Linux tarballs need glibc 2.35 and this base ships 2.34, so `.github/workflows/obscura.yml` builds the pinned commit on AL2023 and publishes it as the `obscura-v<release>` release asset the Dockerfile downloads and checks by sha256. It applies `patches/obscura-mcp-2026-07-28.patch` first, because upstream's `obscura mcp` speaks only MCP 2024-11-05 and `/mcp` speaks only 2026-07-28.
+- Upstream Linux tarballs need glibc 2.35 and this base ships 2.34, so `.github/workflows/obscura.yml` builds the pinned commit on AL2023 and publishes it as the `obscura-v<version>-<patch>` release asset the Dockerfile downloads and checks by sha256. That workflow also applies our MCP patch; it says why.
 
 ---
 
