@@ -139,6 +139,14 @@ struct McpServer {
     next_id: AtomicU64,
 }
 
+/// A server nothing holds any more stops its process: one refused at discover, or
+/// one whose start was cancelled by a dropped request, never lingers.
+impl Drop for McpServer {
+    fn drop(&mut self) {
+        self.link.stop();
+    }
+}
+
 /// What a server's reader, writer and exit watcher share. Whichever of them sees
 /// the server go first stops it for all.
 struct Link {
@@ -212,11 +220,7 @@ impl McpServer {
             link,
             next_id: AtomicU64::new(1),
         });
-        // A refused server is stopped, so it does not linger holding its slot.
-        if let Err(error) = server.discover().await {
-            server.link.stop();
-            return Err(error);
-        }
+        server.discover().await?;
 
         Ok(server)
     }
@@ -516,6 +520,45 @@ for line in sys.stdin:
         let error = format!("{:#}", host.handle(request).await.unwrap_err());
 
         assert!(error.contains(r#"it offers ["2027-01-01"]"#), "{error}");
+    }
+
+    // Writes its pid to argv[1], never answers server/discover, and outlives the
+    // end of its input, so only a kill stops it.
+    const SILENT_SERVER: &str = r#"
+import os, sys, time
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+sys.stdin.read()
+time.sleep(60)
+"#;
+
+    #[tokio::test]
+    async fn a_start_cancelled_during_discover_stops_the_server() {
+        let host = McpHost::default();
+        let pid_file = std::env::temp_dir().join(format!("mcp-silent-{}", uuid::Uuid::new_v4()));
+        let mut request = call("silent", json!(1));
+        request.command = vec![
+            "python3".into(),
+            "-c".into(),
+            SILENT_SERVER.into(),
+            pid_file.display().to_string(),
+        ];
+
+        // Dropping the call mid-discover is what a disconnected HTTP request does.
+        assert!(timeout(Duration::from_secs(2), host.handle(request))
+            .await
+            .is_err());
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        std::fs::remove_file(&pid_file).ok();
+        let started = std::time::Instant::now();
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "server {pid} still running"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
