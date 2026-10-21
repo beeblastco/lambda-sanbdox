@@ -82,6 +82,8 @@ jobs:
         with:
           path: sandbox
           sparse-checkout: patches
+          # The build runs third-party code (build scripts), so leave no token in git config.
+          persist-credentials: false
 
       - name: Apply our patch
         run: git -C obscura apply --verbose "../sandbox/patches/obscura-${OBSCURA_PATCH}.patch"
