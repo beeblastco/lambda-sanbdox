@@ -1,0 +1,76 @@
+diff --git a/crates/obscura-cli/tests/mcp_client.rs b/crates/obscura-cli/tests/mcp_client.rs
+index 5058d6c..66363cc 100644
+--- a/crates/obscura-cli/tests/mcp_client.rs
++++ b/crates/obscura-cli/tests/mcp_client.rs
+@@ -234,7 +234,20 @@ fn test_ping() {
+     let mut c = McpClient::spawn();
+     let resp = c.call("ping", serde_json::json!({}));
+     assert!(resp.get("error").is_none(), "ping should not error");
+-    assert_eq!(resp["result"], serde_json::json!({}));
++    assert_eq!(resp["result"]["resultType"], "complete");
++}
++
++#[test]
++fn test_server_discover() {
++    let mut c = McpClient::spawn();
++    let resp = c.call(
++        "server/discover",
++        serde_json::json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } }),
++    );
++    assert_eq!(resp["result"]["supportedVersions"], serde_json::json!(["2026-07-28"]));
++    assert_eq!(resp["result"]["capabilities"]["tools"], serde_json::json!({}));
++    let tools = c.call("tools/list", serde_json::json!({}));
++    assert_eq!(tools["result"]["cacheScope"], "private");
+ }
+ 
+ #[test]
+diff --git a/crates/obscura-mcp/src/lib.rs b/crates/obscura-mcp/src/lib.rs
+index 6b6b780..4e3b482 100644
+--- a/crates/obscura-mcp/src/lib.rs
++++ b/crates/obscura-mcp/src/lib.rs
+@@ -225,15 +225,44 @@ impl BrowserState {
+ }
+ 
+ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
+-    match method {
++    let mut response = match method {
+         "initialize" => handle_initialize(id, params),
++        // MCP 2026-07-28: the client opens with server/discover instead of
++        // initialize and sends a `_meta` envelope on every request, which the
++        // handlers below ignore.
++        "server/discover" => RpcResponse::ok(id, json!({
++            "supportedVersions": ["2026-07-28"],
++            "capabilities": { "tools": {} }
++        })),
+         "ping" => RpcResponse::ok(id, json!({})),
+         "tools/list" => handle_tools_list(id),
+         "tools/call" => handle_tool_call(id, params, state).await,
+         "resources/list" => RpcResponse::ok(id, json!({"resources": []})),
+         "prompts/list" => RpcResponse::ok(id, json!({"prompts": []})),
+         _ => RpcResponse::err(id, -32601, format!("Unknown method: {method}")),
++    };
++    stamp_2026_result(method, &mut response);
++    response
++}
++
++/// The 2026-07-28 result contract, as the official SDK's encoder applies it:
++/// every result says `resultType`, cacheable ones carry `ttlMs`/`cacheScope`
++/// (0 and "private", the SDK defaults), and `_meta` names the server.
++fn stamp_2026_result(method: &str, response: &mut RpcResponse) {
++    let Some(Value::Object(result)) = response.result.as_mut() else {
++        return;
++    };
++    result.entry("resultType").or_insert(json!("complete"));
++    if matches!(method, "server/discover" | "tools/list" | "resources/list" | "prompts/list") {
++        result.entry("ttlMs").or_insert(json!(0));
++        result.entry("cacheScope").or_insert(json!("private"));
+     }
++    result.entry("_meta").or_insert(json!({
++        "io.modelcontextprotocol/serverInfo": {
++            "name": "obscura-mcp",
++            "version": env!("OBSCURA_BUILD_VERSION")
++        }
++    }));
+ }
+ 
+ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {

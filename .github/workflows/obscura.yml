@@ -9,15 +9,20 @@ name: Obscura binary
 # amazonlinux:2023 on a native arm64 runner. Building once per version keeps the
 # 15+ minute V8 compile out of every image publish.
 #
-# To bump: change OBSCURA_VERSION and OBSCURA_COMMIT below and push. The run publishes
-# release `obscura-v<version>`; copy the sha256 from its summary into the Dockerfile.
-# A version that is already released is skipped.
+# Upstream's `obscura mcp` speaks only MCP 2024-11-05, and the sandbox's /mcp host speaks
+# only 2026-07-28, so the build applies patches/obscura-mcp-2026-07-28.patch on top of the
+# pinned commit. A patch that no longer applies fails the build.
+#
+# To bump: change OBSCURA_VERSION and OBSCURA_COMMIT below, or the patch, then change
+# OBSCURA_RELEASE and push. The run publishes release `obscura-v<release>`; copy the
+# sha256 from its summary into the Dockerfile. A release that already exists is skipped.
 
 on:
   workflow_dispatch:
   push:
     paths:
       - ".github/workflows/obscura.yml"
+      - "patches/obscura-*.patch"
 
 permissions:
   contents: read
@@ -30,6 +35,8 @@ concurrency:
 env:
   OBSCURA_VERSION: "0.2.3"
   OBSCURA_COMMIT: "1a3169da276d7720732c7b20535474942917fb83"
+  # Names the release and its asset: the upstream version plus our patch.
+  OBSCURA_RELEASE: "0.2.3-mcp-2026-07-28"
   RUST_TOOLCHAIN: "1.96.0"
 
 jobs:
@@ -42,8 +49,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "obscura-v${OBSCURA_VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::notice::obscura-v${OBSCURA_VERSION} is already released, nothing to build."
+          if gh release view "obscura-v${OBSCURA_RELEASE}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::obscura-v${OBSCURA_RELEASE} is already released, nothing to build."
             echo "released=true" >> "$GITHUB_OUTPUT"
           else
             echo "released=false" >> "$GITHUB_OUTPUT"
@@ -68,6 +75,15 @@ jobs:
           git clone --depth 1 --branch "v${OBSCURA_VERSION}" https://github.com/h4ckf0r0day/obscura.git obscura
           test "$(git -C obscura rev-parse HEAD)" = "${OBSCURA_COMMIT}"
 
+      - name: Check out our patches
+        uses: actions/checkout@v5
+        with:
+          path: sandbox
+          sparse-checkout: patches
+
+      - name: Apply the MCP 2026-07-28 patch
+        run: git -C obscura apply --verbose ../sandbox/patches/obscura-mcp-2026-07-28.patch
+
       - name: Build
         working-directory: obscura
         run: cargo build --locked --profile release-dist -p obscura-cli --bin obscura --features render
@@ -82,7 +98,7 @@ jobs:
 
       - name: Package
         run: |
-          asset="obscura-${OBSCURA_VERSION}-aarch64-al2023.tar.gz"
+          asset="obscura-${OBSCURA_RELEASE}-aarch64-al2023.tar.gz"
           tar -czf "$asset" -C obscura/target/release-dist obscura
           sha256sum "$asset" | tee "$asset.sha256"
 
@@ -105,12 +121,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          asset="obscura-${OBSCURA_VERSION}-aarch64-al2023.tar.gz"
+          asset="obscura-${OBSCURA_RELEASE}-aarch64-al2023.tar.gz"
           sha=$(cut -d' ' -f1 "$asset.sha256")
-          gh release create "obscura-v${OBSCURA_VERSION}" "$asset" "$asset.sha256" \
+          gh release create "obscura-v${OBSCURA_RELEASE}" "$asset" "$asset.sha256" \
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --latest=false \
-            --title "Obscura ${OBSCURA_VERSION} for the MicroVM base (AL2023, arm64)" \
-            --notes "Obscura v${OBSCURA_VERSION} (commit ${OBSCURA_COMMIT}) built on amazonlinux:2023 with the release-dist profile and the render feature. sha256: ${sha}"
+            --title "Obscura ${OBSCURA_RELEASE} for the MicroVM base (AL2023, arm64)" \
+            --notes "Obscura v${OBSCURA_VERSION} (commit ${OBSCURA_COMMIT}) plus patches/obscura-mcp-2026-07-28.patch, built on amazonlinux:2023 with the release-dist profile and the render feature. sha256: ${sha}"
           echo "OBSCURA_SHA256=${sha}" >> "$GITHUB_STEP_SUMMARY"
