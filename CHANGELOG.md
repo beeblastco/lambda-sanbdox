@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `POST /mcp` hosts stdio MCP servers inside the VM: it starts the named
-  server's command on first use, runs the initialize handshake, keeps the
+  server's command on first use, opens it with MCP 2026-07-28 `server/discover`
+  (refusing a server that does not offer that revision, with no `initialize`
+  fallback), stamps that revision's `_meta` envelope on every message, keeps the
   process alive for the VM's lifetime and relays one JSON-RPC message per call.
 - `/exec` returns `burst`: the VM's vCPU-seconds and GiB-seconds above its
   baseline since boot, so the harness can bill burst the way Lambda does.

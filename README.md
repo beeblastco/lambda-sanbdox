@@ -141,7 +141,9 @@ curl -s -X POST localhost:8080/mcp -H 'content-type: application/json' -d '{
 }'
 ```
 
-- The first message for a `server` name starts `command` and runs the MCP `initialize` handshake. Later messages reuse the same process, so a stateful server such as a browser session keeps its state for as long as the VM lives, across suspend and resume.
+- The host speaks MCP `2026-07-28` only. The first message for a `server` name starts `command` and opens it with `server/discover`; a server whose `supportedVersions` lack `2026-07-28` (a 2025-era server that only answers `initialize`, say) is stopped and the call fails with a JSON-RPC `error` saying so. There is no fallback to `initialize`.
+- Every message the host writes carries the `2026-07-28` `_meta` envelope (`io.modelcontextprotocol/protocolVersion`, `clientInfo`, `clientCapabilities`), so callers send plain `tools/list` / `tools/call` messages. `_meta` keys the caller sets win. Requests from the server are dropped unanswered, as that revision has no server-to-client requests.
+- Later messages reuse the same process, so a stateful server such as a browser session keeps its state for as long as the VM lives, across suspend and resume.
 - A process that exited, or a changed `command` or `env`, is started again on the next message. So is one that wrote a line over 16 MB, which is stopped rather than buffered.
 - The response is the server's JSON-RPC response with HTTP 200. A notification gets HTTP 202. A failure to start or reach the server is a JSON-RPC `error` with HTTP 200, because the proxy's own 502/503 mean the VM is still restoring.
 - Optional `env` sets the server's environment and `timeout_ms` (default 60000, max 600000) bounds the wait for one answer.
