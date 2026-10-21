@@ -131,14 +131,16 @@ RUN dnf install -y \
 # and embedded fonts: `obscura fetch URL --dump markdown|text|links`, `--screenshot`,
 # `--eval`, plus a CDP server (`obscura serve`) and an MCP server (`obscura mcp`). No
 # Chromium. Upstream tarballs need glibc 2.35 and this base has 2.34, so
-# .github/workflows/obscura.yml builds the pinned commit on AL2023 and publishes it as
-# the release asset downloaded here. Bump the version there first, then copy its sha256.
+# .github/workflows/obscura.yml builds the pinned commit on AL2023, with our patch (see
+# there), and publishes it as the release asset downloaded here. Bump the version there
+# first, then copy its sha256.
 FROM runtime AS obscura
 
 ARG OBSCURA_VERSION=0.2.3
-ARG OBSCURA_SHA256=4add3dffa2cfd5790f455d83a3096ead90f1832bd4200d76ecae26d85dac48cc
+ARG OBSCURA_PATCH=mcp-2026-07-28
+ARG OBSCURA_SHA256=863df14a7f77cfebc87043de35453e8f86f92f4b52c9a88eade51a614b3526da
 RUN curl -fsSL -o /tmp/obscura.tar.gz \
-       "https://github.com/beeblastco/lambda-sanbdox/releases/download/obscura-v${OBSCURA_VERSION}/obscura-${OBSCURA_VERSION}-aarch64-al2023.tar.gz" \
+       "https://github.com/beeblastco/lambda-sanbdox/releases/download/obscura-v${OBSCURA_VERSION}-${OBSCURA_PATCH}/obscura-${OBSCURA_VERSION}-${OBSCURA_PATCH}-aarch64-al2023.tar.gz" \
     && echo "${OBSCURA_SHA256}  /tmp/obscura.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/obscura.tar.gz -C /usr/local/bin obscura \
     && rm /tmp/obscura.tar.gz

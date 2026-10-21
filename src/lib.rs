@@ -503,6 +503,20 @@ pub(crate) fn kill_group(pid: u32) {
     }
 }
 
+/// Tests: wait up to 5 s for a killed `pid` to be reaped. True once it is gone.
+#[cfg(test)]
+pub(crate) async fn wait_gone(pid: libc::pid_t) -> bool {
+    for _ in 0..100 {
+        // SAFETY: signal 0 only checks that the pid exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    false
+}
+
 /// Body of a `CappedReader` task: reads `pipe` until EOF or `stop`, keeping the
 /// first `keep` bytes.
 async fn read_capped(
@@ -562,7 +576,6 @@ mod runtime_script_tests {
 mod exec_tests {
     use super::{run_exec, ExecRequest, MAX_STDOUT_SIZE};
     use std::collections::HashMap;
-    use std::time::Duration;
 
     fn bash(code: &str, timeout_ms: u64) -> ExecRequest {
         ExecRequest {
@@ -602,16 +615,10 @@ mod exec_tests {
             .stderr
             .ends_with("execution timed out after 500 ms"));
         // The orphan's new parent reaps it asynchronously, so give it a moment.
-        let mut alive = true;
-        for _ in 0..20 {
-            // SAFETY: signal 0 only checks that the pid exists.
-            alive = unsafe { libc::kill(orphan, 0) } == 0;
-            if !alive {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(!alive, "backgrounded sleep {orphan} survived the timeout");
+        assert!(
+            crate::wait_gone(orphan).await,
+            "backgrounded sleep {orphan} survived the timeout"
+        );
     }
 
     #[tokio::test]

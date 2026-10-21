@@ -1,0 +1,49 @@
+diff --git a/crates/obscura-mcp/src/lib.rs b/crates/obscura-mcp/src/lib.rs
+index 6b6b780..d1946a6 100644
+--- a/crates/obscura-mcp/src/lib.rs
++++ b/crates/obscura-mcp/src/lib.rs
+@@ -224,16 +224,43 @@ impl BrowserState {
+     }
+ }
+ 
++/// Answers MCP 2026-07-28 `server/discover` too; handlers ignore the request `_meta` envelope.
+ pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
+-    match method {
++    let mut response = match method {
+         "initialize" => handle_initialize(id, params),
++        "server/discover" => RpcResponse::ok(id, json!({
++            "supportedVersions": ["2026-07-28"],
++            "capabilities": { "tools": {} }
++        })),
+         "ping" => RpcResponse::ok(id, json!({})),
+         "tools/list" => handle_tools_list(id),
+         "tools/call" => handle_tool_call(id, params, state).await,
+         "resources/list" => RpcResponse::ok(id, json!({"resources": []})),
+         "prompts/list" => RpcResponse::ok(id, json!({"prompts": []})),
+         _ => RpcResponse::err(id, -32601, format!("Unknown method: {method}")),
++    };
++    stamp_2026_result(method, &mut response);
++    response
++}
++
++/// The 2026-07-28 result contract, as the official SDK's encoder applies it:
++/// every result says `resultType`, cacheable ones carry `ttlMs`/`cacheScope`
++/// (0 and "private", the SDK defaults), and `_meta` names the server.
++fn stamp_2026_result(method: &str, response: &mut RpcResponse) {
++    let Some(Value::Object(result)) = response.result.as_mut() else {
++        return;
++    };
++    result.entry("resultType").or_insert(json!("complete"));
++    if matches!(method, "server/discover" | "tools/list" | "resources/list" | "prompts/list") {
++        result.entry("ttlMs").or_insert(json!(0));
++        result.entry("cacheScope").or_insert(json!("private"));
+     }
++    result.entry("_meta").or_insert(json!({
++        "io.modelcontextprotocol/serverInfo": {
++            "name": "obscura-mcp",
++            "version": env!("OBSCURA_BUILD_VERSION")
++        }
++    }));
+ }
+ 
+ pub async fn run(proxy: Option<String>, user_agent: Option<String>, stealth: bool) -> Result<()> {
